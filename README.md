@@ -276,4 +276,4 @@ confluent flink environment list \
 ./demo.sh down --yes    # skip the prompt
 ```
 
-Also stops any background port-forwards started by this script.
+Also stops any background port-forwards started by this script...
