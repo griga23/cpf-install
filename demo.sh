@@ -27,6 +27,22 @@ require_cmds() {
   done
 }
 
+require_aws_identity() {
+  aws sts get-caller-identity >/dev/null 2>&1 \
+    || die "aws CLI is not authenticated (or AWS_PROFILE/credentials are invalid) - run 'aws sts get-caller-identity' to diagnose, export the correct AWS_PROFILE, and retry"
+}
+
+# Catches a confusing failure mode: `confluent context list` can show a
+# "current" context that's actually stale/corrupted, in which case every
+# `confluent flink ...` call below fails with "not logged in" even though a
+# context exists. This is unrelated to which cloud/CMF instance is targeted -
+# the flink subcommands only talk to CMF via $CONFLUENT_CMF_URL/--url - the
+# CLI just independently requires some valid session before running anything.
+require_confluent_login() {
+  confluent flink environment list >/dev/null 2>&1 \
+    || die "confluent CLI is not logged in (or its session is stale/corrupted) - run 'confluent context list', clear any broken contexts with 'confluent context delete <name>', then 'confluent login --save' and retry. Any login works (Confluent Cloud or Platform) since these commands talk to CMF via \$CONFLUENT_CMF_URL regardless of the login's own target"
+}
+
 ensure_namespace() {
   kubectl get namespace "$1" >/dev/null 2>&1 || kubectl create namespace "$1"
 }
@@ -104,6 +120,13 @@ ensure_c3_port_forward() {
 # ---------------------------------------------------------------------------
 
 cmd_cluster() {
+  case "$CLOUD" in
+    gcp) cmd_cluster_gcp ;;
+    aws) cmd_cluster_aws ;;
+  esac
+}
+
+cmd_cluster_gcp() {
   require_cmds gcloud kubectl
   log "Creating GKE cluster '$CLUSTER_NAME' in $ZONE (project $PROJECT)"
   if gcloud container clusters describe "$CLUSTER_NAME" --zone "$ZONE" --project "$PROJECT" >/dev/null 2>&1; then
@@ -117,6 +140,82 @@ cmd_cluster() {
   fi
   gcloud container clusters get-credentials "$CLUSTER_NAME" --zone "$ZONE" --project "$PROJECT"
   kubectl cluster-info
+}
+
+cmd_cluster_aws() {
+  require_cmds eksctl aws kubectl
+  require_aws_identity
+  log "Creating EKS cluster '$EKS_CLUSTER_NAME' in $EKS_REGION"
+  if aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --region "$EKS_REGION" >/dev/null 2>&1; then
+    warn "cluster '$EKS_CLUSTER_NAME' already exists, skipping create"
+  else
+    eksctl create cluster \
+      --name "$EKS_CLUSTER_NAME" \
+      --region "$EKS_REGION" \
+      --nodes "$EKS_NUM_NODES" \
+      --node-type "$EKS_NODE_TYPE" \
+      --managed \
+      --with-oidc \
+      --tags "cflt_managed_by=user,cflt_managed_id=${CFLT_USER}"
+  fi
+  aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$EKS_REGION"
+  kubectl cluster-info
+  setup_ebs_csi_driver
+}
+
+# Installs the EBS CSI driver as an EKS add-on (in-cluster, not a local install) with an
+# IRSA-backed IAM role, and applies a default gp3 StorageClass - the AWS equivalent of the
+# default StorageClass GKE ships with out of the box, needed so the Kafka/SR/Control Center
+# PVCs (dataVolumeCapacity in cp/cp.yaml) can bind. extraVolumeTags on the addon config tags
+# every EBS volume the driver dynamically provisions, so PVC-backed disks get the same
+# cflt_managed_by/cflt_managed_id tags as the rest of the cluster's resources.
+setup_ebs_csi_driver() {
+  local role_name="${EKS_CLUSTER_NAME}-ebs-csi-driver-role" account_id role_arn addon_config
+  log "Setting up EBS CSI driver add-on (IRSA role + addon + default gp3 StorageClass)"
+  account_id=$(aws sts get-caller-identity --query Account --output text)
+  role_arn="arn:aws:iam::${account_id}:role/${role_name}"
+
+  if ! aws iam get-role --role-name "$role_name" >/dev/null 2>&1; then
+    eksctl create iamserviceaccount \
+      --cluster "$EKS_CLUSTER_NAME" --region "$EKS_REGION" \
+      --namespace kube-system --name ebs-csi-controller-sa \
+      --role-name "$role_name" \
+      --attach-policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
+      --role-only --approve \
+      --tags "cflt_managed_by=user,cflt_managed_id=${CFLT_USER}"
+  fi
+
+  # `eksctl create addon --configuration-values` isn't available as a bare CLI flag on
+  # every eksctl build - a ClusterConfig file passed via --config-file works everywhere.
+  addon_config=$(mktemp)
+  cat > "$addon_config" <<EOF
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: ${EKS_CLUSTER_NAME}
+  region: ${EKS_REGION}
+addons:
+  - name: aws-ebs-csi-driver
+    serviceAccountRoleARN: ${role_arn}
+    configurationValues: '{"controller":{"extraVolumeTags":{"cflt_managed_by":"user","cflt_managed_id":"${CFLT_USER}"}}}'
+EOF
+  eksctl create addon --config-file "$addon_config" --force --wait
+  rm -f "$addon_config"
+
+  kubectl apply -f - <<'EOF'
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+EOF
+
+  kubectl -n kube-system rollout status deployment/ebs-csi-controller --timeout=180s \
+    || warn "ebs-csi-controller not Ready yet - check: kubectl -n kube-system get pods -l app=ebs-csi-controller"
 }
 
 cmd_helm_repo() {
@@ -200,6 +299,7 @@ cmd_stop_port_forward() {
 cmd_flink_environments() {
   require_cmds confluent
   ensure_cmf_port_forward
+  require_confluent_login
   for env in $FLINK_ENVIRONMENTS; do
     log "Creating Flink environment '$env'"
     confluent flink environment create "$env" --kubernetes-namespace "$env" \
@@ -211,6 +311,7 @@ cmd_flink_environments() {
 cmd_catalog() {
   require_cmds confluent
   ensure_cmf_port_forward
+  require_confluent_login
   log "Creating Kafka catalog '$CATALOG_NAME' from $CATALOG_FILE"
   confluent flink catalog create "$CATALOG_FILE" || warn "catalog may already exist"
   log "Creating database '$DATABASE_NAME' from $DATABASE_FILE (DDL permissions for: $FLINK_ENVIRONMENTS)"
@@ -245,6 +346,7 @@ create_or_update_compute_pool() {
 cmd_compute_pool() {
   require_cmds confluent
   ensure_cmf_port_forward
+  require_confluent_login
   for env in $FLINK_ENVIRONMENTS; do
     create_or_update_compute_pool "$env" "$COMPUTE_POOL_NAME" "$COMPUTE_POOL_FILE" DEDICATED
     create_or_update_compute_pool "$env" "$SHARED_COMPUTE_POOL_NAME" "$SHARED_COMPUTE_POOL_FILE" SHARED
@@ -290,6 +392,7 @@ run_pipeline_statement() {
 cmd_statement() {
   require_cmds confluent jq
   ensure_cmf_port_forward
+  require_confluent_login
   local env="${1:-prod}" phase
 
   log "Creating table 'demo_events' in '$env' (compute pool: $SHARED_COMPUTE_POOL_NAME)"
@@ -335,6 +438,7 @@ cmd_statement() {
 cmd_generate_data() {
   require_cmds confluent jq
   ensure_cmf_port_forward
+  require_confluent_login
   local env="${1:-prod}" count="${2:-$GENERATE_DATA_ROW_COUNT}" pool="${3:-$SHARED_COMPUTE_POOL_NAME}"
   local categories=(A B) suffix tmpfile name phase i offset val cat sep pool_type
 
@@ -415,6 +519,7 @@ run_verify_statement() {
 cmd_verify() {
   require_cmds confluent jq
   ensure_cmf_port_forward
+  require_confluent_login
   local env="${1:-prod}"
   local probe_table="__verify_probe"
   log "Running startup verification statements in environment '$env'"
@@ -431,6 +536,7 @@ cmd_verify() {
 cmd_application() {
   require_cmds confluent
   ensure_cmf_port_forward
+  require_confluent_login
   local env="${1:-prod}"
   local file="${2:-$APPLICATION_FILE}"
   [[ -f "$file" ]] || die "application file not found: $file"
@@ -479,8 +585,15 @@ cmd_up() {
 }
 
 cmd_down() {
-  require_cmds gcloud
   cmd_stop_port_forward || true
+  case "$CLOUD" in
+    gcp) cmd_down_gcp "$@" ;;
+    aws) cmd_down_aws "$@" ;;
+  esac
+}
+
+cmd_down_gcp() {
+  require_cmds gcloud
   if [[ "${1:-}" != "--yes" ]]; then
     read -r -p "This will DELETE the GKE cluster '$CLUSTER_NAME' in $ZONE (project $PROJECT). Type 'yes' to continue: " confirm
     [[ "$confirm" == "yes" ]] || { echo "Aborted."; exit 1; }
@@ -489,16 +602,60 @@ cmd_down() {
   gcloud container clusters delete "$CLUSTER_NAME" --zone "$ZONE" --project "$PROJECT" --quiet
 }
 
+cmd_down_aws() {
+  require_cmds eksctl aws
+  require_aws_identity
+  if [[ "${1:-}" != "--yes" ]]; then
+    read -r -p "This will DELETE the EKS cluster '$EKS_CLUSTER_NAME' in $EKS_REGION. Type 'yes' to continue: " confirm
+    [[ "$confirm" == "yes" ]] || { echo "Aborted."; exit 1; }
+  fi
+
+  if kubectl cluster-info >/dev/null 2>&1; then
+    # PVCs stay stuck Terminating as long as their pod is still running (the
+    # pvc-protection finalizer blocks it) - waiting here would just block for no
+    # reason, since nothing evicts those pods until eksctl drains the nodegroup
+    # below. Mark them for deletion (non-blocking) so the PV's Delete reclaim
+    # policy fires as soon as the drain releases each volume.
+    log "Marking PVCs for deletion (their EBS volumes release once eksctl drains the nodegroup below)"
+    for ns in "$CONFLUENT_NAMESPACE" $FLINK_ENVIRONMENTS; do
+      kubectl -n "$ns" delete pvc --all --wait=false 2>/dev/null || true
+    done
+  fi
+
+  log "Deleting EKS cluster '$EKS_CLUSTER_NAME' (region $EKS_REGION)"
+  eksctl delete cluster --name "$EKS_CLUSTER_NAME" --region "$EKS_REGION" --wait
+
+  local leftover
+  leftover=$(aws ec2 describe-volumes --region "$EKS_REGION" \
+    --filters "Name=tag:cflt_managed_id,Values=${CFLT_USER}" \
+    --query 'Volumes[].VolumeId' --output text 2>/dev/null || true)
+  if [[ -n "$leftover" ]]; then
+    warn "leftover EBS volumes tagged cflt_managed_id=${CFLT_USER} were not cleaned up automatically: $leftover - delete manually with: aws ec2 delete-volume --volume-id <id> --region $EKS_REGION"
+  fi
+}
+
 cmd_help() {
   cat <<'EOF'
-Usage: ./demo.sh <subcommand> [args]
+Usage: ./demo.sh --gcp|--aws [--user <cflt-username>] <subcommand> [args]
+
+Cloud selection (required for every subcommand except help/-h/--help):
+  --gcp                    Use GKE (existing behavior)
+  --aws --user <name>      Use EKS; --user tags all AWS resources this script
+                           creates (cflt_managed_by=user, cflt_managed_id=<name>)
+                           - use the part of your @confluent.io email before the @
+  Flags may appear anywhere on the command line, e.g.:
+    ./demo.sh --gcp up
+    ./demo.sh --aws --user myusername up
+    ./demo.sh up --aws --user myusername
 
 Full flow:
   up                    Run every step below in order (cluster -> ... -> compute pools)
-  down [--yes]           Stop port-forwards and delete the GKE cluster
+  down [--yes]           Stop port-forwards and delete the GKE/EKS cluster
 
 Individual steps (same order as `up`):
-  cluster                Create the GKE cluster and fetch kubectl credentials
+  cluster                Create the GKE/EKS cluster and fetch kubectl credentials
+                          (EKS also installs the EBS CSI driver add-on and a
+                          default gp3 StorageClass, so PVCs bind like on GKE)
   helm-repo               Add/update the confluentinc helm repo
   namespace               Create the confluent namespace and set it as default context
   operator                Install the confluent-for-kubernetes operator
@@ -528,15 +685,55 @@ Utilities:
   help                    Show this message
 
 Config can be overridden via environment variables, e.g.:
-  PROJECT=my-proj ZONE=us-central1-a CLUSTER_NAME=my-cluster ./demo.sh cluster
+  PROJECT=my-proj ZONE=us-central1-a CLUSTER_NAME=my-cluster ./demo.sh --gcp cluster
+  EKS_REGION=us-east-1 EKS_CLUSTER_NAME_PREFIX=my-cluster ./demo.sh --aws --user myusername cluster
 EOF
 }
+
+# ---------------------------------------------------------------------------
+# Argument parsing - pulls --gcp/--aws/--user out of "$@" wherever they
+# appear, leaving the rest as positionals for the subcommand dispatch below.
+# ---------------------------------------------------------------------------
+CLOUD=""
+CFLT_USER=""
+saw_gcp=0 saw_aws=0
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --gcp) CLOUD="gcp"; saw_gcp=1; shift ;;
+    --aws) CLOUD="aws"; saw_aws=1; shift ;;
+    --user)
+      [[ $# -ge 2 ]] || die "--user requires a value, e.g. --user myusername"
+      CFLT_USER="$2"; shift 2 ;;
+    --user=*) CFLT_USER="${1#--user=}"; shift ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+(( saw_gcp && saw_aws )) && die "specify exactly one of --gcp or --aws, not both"
+
+# bash 3.2 (macOS default) throws "unbound variable" expanding an empty array
+# under set -u - always length-check before expanding.
+if [[ ${#POSITIONAL[@]} -gt 0 ]]; then
+  set -- "${POSITIONAL[@]}"
+else
+  set --
+fi
 
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 sub="${1:-help}"
-shift || true
+[[ $# -gt 0 ]] && shift
+
+if [[ "$sub" != "help" && "$sub" != "-h" && "$sub" != "--help" ]]; then
+  [[ -n "$CLOUD" ]] || die "must specify a cloud: pass exactly one of --gcp or --aws (e.g. './demo.sh --gcp up' or './demo.sh --aws --user myusername up')"
+  [[ "$CLOUD" == "aws" && -z "$CFLT_USER" ]] && die "--aws requires --user <cflt-username> (the part of your @confluent.io email before the @, e.g. --user myusername)"
+fi
+
+# The real cluster name is always "<prefix>-<user>", so people sharing an AWS
+# account/region never collide on the same EKS cluster.
+[[ "$CLOUD" == "aws" ]] && EKS_CLUSTER_NAME="${EKS_CLUSTER_NAME_PREFIX}-${CFLT_USER}"
+
 case "$sub" in
   up) cmd_up "$@" ;;
   down) cmd_down "$@" ;;
