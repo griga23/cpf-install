@@ -257,18 +257,17 @@ confluent flink environment list \
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `up` hangs on a wait step | Best-effort readiness wait timed out (10 min Kafka, 3 min others) | `kubectl -n confluent get pods`, re-run the specific subcommand once healthy |
-| `confluent flink ...` fails with a connection error | CMF port-forward died | `./demo.sh port-forward` |
-| `CREATE TABLE`/DDL fails, `SELECT`/`INSERT` work fine | `ddlEnvironments` missing the environment | `./demo.sh catalog` re-applies it; check with `curl -s $CONFLUENT_CMF_URL/cmf/api/v1/catalogs/kafka/kafka-cat/databases/kafka-db \| jq .spec.ddlEnvironments` |
-| Pod stuck `Pending` (`Insufficient cpu`) but `kubectl top nodes` shows low usage | Kubernetes schedules on CPU *requests*, not actual usage | Lower `cpu` in `flink/compute-pool*.json` / the `FlinkApplication` JSON (already `0.5`), or bump `NUM_NODES`/`MACHINE_TYPE`. Trade-off: lower `cpu` also means slower pod cold-start/execution (a DEDICATED pool job can take 1-2 minutes instead of ~60s) |
-| Job crash-loops: `transaction timeout is larger than the maximum value allowed by the broker` | Kafka sink's default transaction timeout exceeds the broker max | Add `/*+ OPTIONS('properties.transaction.timeout.ms'='300000') */` after `INSERT INTO` (already in `sql/insert_demo_data.sql`, `sql/streaming_aggregation.sql`) |
-| Bounded `INSERT`/`SELECT` on `shared-pool` stuck `PENDING`/`RUNNING` forever | Operator bug — the `FlinkSessionJob` gets stuck `RECONCILING` (`UpgradeFailureException: Latest checkpoint not externally addressable`) even after the job finishes | Run bounded/one-shot work on the DEDICATED `pool` instead |
-| `describe -o json` / `--wait` missing `.result.results.data`, or `--wait` errors `retry failed due to timeout of 1m0s` | CLI `--wait` has a hard ~60s timeout; inline results are unreliable for real `SELECT`/`INSERT` | Poll `.status.phase` manually; fetch rows from `.../statements/<name>/results` |
-| `demo.sh` exits silently mid-pipeline, no error printed | `set -euo pipefail` + `var=$(cmd \| jq ...)`: if `cmd` fails, the pipeline's exit status is non-zero (due to `pipefail`), so the assignment itself trips `set -e` and exits *before* any `\|\| die`/`warn` handling runs, even ones written to catch exactly this. Every such assignment in `demo.sh` (including inside `wait_for_statement_phase`'s polling loop) ends in `\|\| true` so the intended check always runs — apply the same pattern to any new one you add | N/A — already fixed everywhere in this script |
-| `SHARED` pool won't resize (`409`) | Active statements in a non-updatable phase | `confluent --environment <env> flink statement stop <name>`, then retry |
-| Compute pool `PUT` returns 200 but pods still show old resources | Operator redeploys asynchronously | Wait a few seconds; `kubectl -n <env> get pods -w` |
+| Symptom | Fix |
+|---|---|
+| `up` hangs on a wait step | Check `kubectl -n confluent get pods`, re-run the subcommand once healthy |
+| `confluent flink ...` connection error | CMF port-forward died — run `./demo.sh port-forward` |
+| DDL fails but `SELECT`/`INSERT` work | `ddlEnvironments` missing the environment — re-run `./demo.sh catalog` |
+| Pod stuck `Pending` (`Insufficient cpu`) despite low `kubectl top nodes` usage | K8s schedules on CPU *requests*, not usage — lower `cpu` in the pool/app JSON, or bump `NUM_NODES`/`MACHINE_TYPE` |
+| Job crash-loops with a Kafka transaction timeout error | Add `/*+ OPTIONS('properties.transaction.timeout.ms'='300000') */` after `INSERT INTO` |
+| Bounded `INSERT`/`SELECT` on `shared-pool` stuck `PENDING`/`RUNNING` forever | Operator bug — run bounded/one-shot work on the DEDICATED `pool` instead |
+| `--wait` times out or is missing result data | Don't use `--wait`; poll `.status.phase` and fetch rows from `.../statements/<name>/results` |
+| `SHARED` pool won't resize (`409`) | Stop active statements first: `confluent --environment <env> flink statement stop <name>` |
+| Compute pool `PUT` returns 200 but pods unchanged | Wait a few seconds — the operator redeploys asynchronously |
 
 ## Teardown
 
