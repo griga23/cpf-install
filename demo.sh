@@ -469,13 +469,15 @@ cmd_up() {
   cmd_flink_operator
   cmd_cmf
   cmd_port_forward
+  cmd_c3_forward
   cmd_flink_environments
   cmd_catalog
   cmd_compute_pool
   for env in $FLINK_ENVIRONMENTS; do
     cmd_verify "$env"
   done
-  log "Environment is up. Try: ./demo.sh statement, then ./demo.sh status"
+  log "Environment is up. CMF: ${CONFLUENT_CMF_URL} - Control Center: http://localhost:${C3_LOCAL_PORT}/home"
+  log "Try: ./demo.sh statement, then ./demo.sh status"
 }
 
 cmd_down() {
