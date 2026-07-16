@@ -624,12 +624,30 @@ cmd_down_aws() {
   log "Deleting EKS cluster '$EKS_CLUSTER_NAME' (region $EKS_REGION)"
   eksctl delete cluster --name "$EKS_CLUSTER_NAME" --region "$EKS_REGION" --wait
 
-  local leftover
+  local leftover vol attempt still_left
   leftover=$(aws ec2 describe-volumes --region "$EKS_REGION" \
     --filters "Name=tag:cflt_managed_id,Values=${CFLT_USER}" \
     --query 'Volumes[].VolumeId' --output text 2>/dev/null || true)
   if [[ -n "$leftover" ]]; then
-    warn "leftover EBS volumes tagged cflt_managed_id=${CFLT_USER} were not cleaned up automatically: $leftover - delete manually with: aws ec2 delete-volume --volume-id <id> --region $EKS_REGION"
+    # These are the PVC-provisioned data volumes (Kafka/SR/Control Center) - they live
+    # outside eksctl's CloudFormation stack, so eksctl's own deletion never touches them.
+    # Right after the cluster disappears they can briefly still show "in-use" while AWS
+    # finishes detaching them, so retry for a bit instead of giving up after one try.
+    log "Deleting leftover EBS volumes tagged cflt_managed_id=${CFLT_USER}: $leftover"
+    for vol in $leftover; do
+      for attempt in 1 2 3 4 5 6; do
+        aws ec2 delete-volume --volume-id "$vol" --region "$EKS_REGION" 2>/dev/null && break
+        sleep 5
+      done
+    done
+    still_left=$(aws ec2 describe-volumes --region "$EKS_REGION" \
+      --filters "Name=tag:cflt_managed_id,Values=${CFLT_USER}" \
+      --query 'Volumes[].VolumeId' --output text 2>/dev/null || true)
+    if [[ -n "$still_left" ]]; then
+      warn "could not delete these leftover EBS volumes automatically (likely still detaching): $still_left - delete manually with: aws ec2 delete-volume --volume-id <id> --region $EKS_REGION"
+    else
+      log "Leftover EBS volumes deleted"
+    fi
   fi
 }
 
