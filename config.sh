@@ -6,10 +6,12 @@
 #   PROJECT=my-proj ZONE=us-central1-a CLUSTER_NAME=my-demo ./demo.sh cluster
 # Otherwise, edit the defaults below directly.
 
-# --- GKE cluster ---
+# --- GKE cluster (GCP) ---
 : "${PROJECT:=sales-engineering-206314}"
 : "${ZONE:=europe-west1-b}"
-: "${CLUSTER_NAME:=jsvobodagke}"
+# The actual cluster name is always "<prefix>-<cflt-username>" (see demo.sh),
+# mirroring EKS, so people sharing a project never collide on the same cluster.
+: "${GKE_CLUSTER_NAME_PREFIX:=cpf-gke-demo}"
 : "${NUM_NODES:=3}"
 : "${MACHINE_TYPE:=e2-standard-4}"
 

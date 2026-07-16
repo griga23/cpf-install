@@ -137,6 +137,7 @@ cmd_cluster_gcp() {
       --zone "$ZONE" \
       --num-nodes "$NUM_NODES" \
       --machine-type "$MACHINE_TYPE" \
+      --labels "cflt_managed_by=user,cflt_managed_id=${CFLT_USER}" \
       --project "$PROJECT"
   fi
   gcloud container clusters get-credentials "$CLUSTER_NAME" --zone "$ZONE" --project "$PROJECT"
@@ -395,26 +396,52 @@ cmd_statement() {
   require_confluent_login
   local env="${1:-prod}" phase
 
-  log "Creating table 'demo_events' in '$env' (compute pool: $SHARED_COMPUTE_POOL_NAME)"
-  phase=$(run_pipeline_statement "$env" create-demo-events "$SHARED_COMPUTE_POOL_NAME" "$CREATE_EVENTS_SQL_FILE" 60 COMPLETED) || true
+  # By default DDL/streaming run on the SHARED pool and the one-shot data load
+  # runs on the DEDICATED pool (see the insert comment below). Passing a pool
+  # name as the 2nd positional arg overrides *every* step to run on that single
+  # pool, e.g. ./demo.sh --aws --user <name> statement prod shared-pool
+  local ddl_pool="${2:-$SHARED_COMPUTE_POOL_NAME}"
+  local insert_pool="${2:-$COMPUTE_POOL_NAME}"
+
+  log "Creating table 'demo_events' in '$env' (compute pool: $ddl_pool)"
+  phase=$(run_pipeline_statement "$env" create-demo-events "$ddl_pool" "$CREATE_EVENTS_SQL_FILE" 60 COMPLETED) || true
   [[ "$phase" == "COMPLETED" ]] || die "creating demo_events failed (phase=$phase) - check: confluent --environment $env flink statement describe create-demo-events"
   delete_statement_quiet "$env" create-demo-events
 
-  log "Creating table 'demo_aggregated' in '$env' (compute pool: $SHARED_COMPUTE_POOL_NAME)"
-  phase=$(run_pipeline_statement "$env" create-demo-aggregated "$SHARED_COMPUTE_POOL_NAME" "$CREATE_AGGREGATED_SQL_FILE" 60 COMPLETED) || true
+  log "Creating table 'demo_aggregated' in '$env' (compute pool: $ddl_pool)"
+  phase=$(run_pipeline_statement "$env" create-demo-aggregated "$ddl_pool" "$CREATE_AGGREGATED_SQL_FILE" 60 COMPLETED) || true
   [[ "$phase" == "COMPLETED" ]] || die "creating demo_aggregated failed (phase=$phase) - check: confluent --environment $env flink statement describe create-demo-aggregated"
   delete_statement_quiet "$env" create-demo-aggregated
 
-  # Bounded jobs submitted to the SHARED pool get stuck reporting RECONCILING forever
-  # once they finish (an operator status-reporting quirk - see README troubleshooting),
-  # so the one-shot data load runs on the DEDICATED pool instead, where it reports
-  # COMPLETED correctly (just slower, since it cold-starts its own cluster).
-  log "Inserting demo data into 'demo_events' in '$env' (compute pool: $COMPUTE_POOL_NAME)"
-  phase=$(run_pipeline_statement "$env" insert-demo-data "$COMPUTE_POOL_NAME" "$INSERT_DEMO_DATA_SQL_FILE" 150 COMPLETED) || true
-  [[ "$phase" == "COMPLETED" ]] || die "inserting demo data failed (phase=$phase) - check: confluent --environment $env flink statement describe insert-demo-data"
+  # One-shot bounded data load. On a DEDICATED pool it reports COMPLETED reliably
+  # (just slower, since it cold-starts its own cluster). On a SHARED pool bounded
+  # jobs actually finish but get stuck reporting a non-terminal phase forever (an
+  # operator status-reporting quirk - see README troubleshooting), so there's
+  # nothing reliable to poll - we give it a short grace period and move on. The
+  # pool type is looked up so an overridden pool is handled correctly either way.
+  local insert_pool_type
+  insert_pool_type=$(confluent flink compute-pool describe --environment "$env" "$insert_pool" -o json 2>/dev/null | jq -r '.spec.type // empty') || true
+  [[ -n "$insert_pool_type" ]] || die "compute pool '$insert_pool' not found in environment '$env'"
+  [[ -f "$INSERT_DEMO_DATA_SQL_FILE" ]] || die "SQL file not found: $INSERT_DEMO_DATA_SQL_FILE"
+  log "Inserting demo data into 'demo_events' in '$env' (compute pool: $insert_pool, type: $insert_pool_type)"
   delete_statement_quiet "$env" insert-demo-data
+  confluent --environment "$env" flink statement create insert-demo-data \
+    --catalog "$CATALOG_NAME" \
+    --database "$DATABASE_NAME" \
+    --compute-pool "$insert_pool" \
+    --parallelism 1 \
+    --sql "$(cat "$INSERT_DEMO_DATA_SQL_FILE")" >/dev/null
+  if [[ "$insert_pool_type" == "SHARED" ]]; then
+    sleep 10
+    delete_statement_quiet "$env" insert-demo-data
+    warn "insert ran on SHARED pool '$insert_pool' - completion isn't verifiable, but should already be done"
+  else
+    phase=$(wait_for_statement_phase "$env" insert-demo-data 150 COMPLETED) || true
+    [[ "$phase" == "COMPLETED" ]] || die "inserting demo data failed (phase=$phase) - check: confluent --environment $env flink statement describe insert-demo-data"
+    delete_statement_quiet "$env" insert-demo-data
+  fi
 
-  log "Starting continuous streaming aggregation '$STATEMENT_NAME' in '$env' (compute pool: $SHARED_COMPUTE_POOL_NAME)"
+  log "Starting continuous streaming aggregation '$STATEMENT_NAME' in '$env' (compute pool: $ddl_pool)"
   if confluent --environment "$env" flink statement describe "$STATEMENT_NAME" >/dev/null 2>&1; then
     warn "statement '$STATEMENT_NAME' already exists in '$env' - leaving it as is"
     return 0
@@ -423,7 +450,7 @@ cmd_statement() {
   confluent --environment "$env" flink statement create "$STATEMENT_NAME" \
     --catalog "$CATALOG_NAME" \
     --database "$DATABASE_NAME" \
-    --compute-pool "$SHARED_COMPUTE_POOL_NAME" \
+    --compute-pool "$ddl_pool" \
     --parallelism 1 \
     --sql "$(cat "$STREAMING_SQL_FILE")" >/dev/null
   phase=$(wait_for_statement_phase "$env" "$STATEMENT_NAME" 60 RUNNING) || true
@@ -655,15 +682,20 @@ cmd_down_aws() {
 
 cmd_help() {
   cat <<'EOF'
-Usage: ./demo.sh --gcp|--aws [--user <cflt-username>] <subcommand> [args]
+Usage: ./demo.sh --gcp|--aws --user <cflt-username> <subcommand> [args]
 
 Cloud selection (required for every subcommand except help/-h/--help):
-  --gcp                    Use GKE (existing behavior)
-  --aws --user <name>      Use EKS; --user tags all AWS resources this script
-                           creates (cflt_managed_by=user, cflt_managed_id=<name>)
-                           - use the part of your @confluent.io email before the @
+  --gcp                    Use GKE
+  --aws                    Use EKS
+  --user <name>            Required for both clouds. Names your cluster
+                           (<prefix>-<name>, e.g. cpf-gke-demo-myusername /
+                           cpf-eks-demo-myusername) so people sharing a project/
+                           account never collide, and tags every cloud resource
+                           this script creates (cflt_managed_by=user,
+                           cflt_managed_id=<name>). Use the part of your
+                           @confluent.io email before the @.
   Flags may appear anywhere on the command line, e.g.:
-    ./demo.sh --gcp up
+    ./demo.sh --gcp --user myusername up
     ./demo.sh --aws --user myusername up
     ./demo.sh up --aws --user myusername
 
@@ -690,8 +722,11 @@ Individual steps (same order as `up`):
                           (flink/compute-pool-shared.json) in prod and test
   verify [env]            Create/describe/drop a disposable table on the shared pool to
                           sanity-check the environment (default env: prod)
-  statement [env]         Create demo_events/demo_aggregated, seed demo data, and start the
-                          continuous windowed-aggregation job (default env: prod)
+  statement [env] [pool]  Create demo_events/demo_aggregated, seed demo data, and start the
+                          continuous windowed-aggregation job (default env: prod). By default
+                          DDL/streaming run on shared-pool and the data load on the DEDICATED
+                          pool; pass a pool name to run every step on that single pool, e.g.
+                          ./demo.sh --aws --user <name> statement prod shared-pool
   generate-data [env] [count] [pool]  Insert more random rows into demo_events on demand
                           (default env: prod, count: 20, pool: shared-pool -
                           pass e.g. "pool" as 3rd arg to use the DEDICATED
@@ -704,8 +739,8 @@ Utilities:
   help                    Show this message
 
 Config can be overridden via environment variables, e.g.:
-  PROJECT=my-proj ZONE=us-central1-a CLUSTER_NAME=my-cluster ./demo.sh --gcp cluster
-  EKS_REGION=us-east-1 EKS_CLUSTER_NAME_PREFIX=my-cluster ./demo.sh --aws --user myusername cluster
+  PROJECT=my-proj ZONE=us-central1-a GKE_CLUSTER_NAME_PREFIX=my-demo ./demo.sh --gcp --user myusername cluster
+  EKS_REGION=us-east-1 EKS_CLUSTER_NAME_PREFIX=my-demo ./demo.sh --aws --user myusername cluster
 EOF
 }
 
@@ -745,16 +780,25 @@ sub="${1:-help}"
 [[ $# -gt 0 ]] && shift
 
 if [[ "$sub" != "help" && "$sub" != "-h" && "$sub" != "--help" ]]; then
-  [[ -n "$CLOUD" ]] || die "must specify a cloud: pass exactly one of --gcp or --aws (e.g. './demo.sh --gcp up' or './demo.sh --aws --user myusername up')"
-  [[ "$CLOUD" == "aws" && -z "$CFLT_USER" ]] && die "--aws requires --user <cflt-username> (the part of your @confluent.io email before the @, e.g. --user myusername)"
+  [[ -n "$CLOUD" ]] || die "must specify a cloud: pass exactly one of --gcp or --aws (e.g. './demo.sh --gcp --user myusername up' or './demo.sh --aws --user myusername up')"
+  [[ -z "$CFLT_USER" ]] && die "--user <cflt-username> is required (the part of your @confluent.io email before the @, e.g. --user myusername) - it names your cluster (<prefix>-<user>) and tags every cloud resource this script creates"
+  # --user becomes part of the GKE/EKS cluster name (<prefix>-<user>) and a GCP
+  # label value, so it must satisfy the strictest of those: lowercase letters,
+  # digits, and internal hyphens only (no dots, underscores, uppercase, or
+  # leading/trailing hyphen). Validate up front rather than letting gcloud/eksctl
+  # reject the derived name with a cryptic error later. Note: an email local part
+  # like 'first.last' is NOT valid - drop the dot (e.g. --user firstlast).
+  [[ "$CFLT_USER" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
+    || die "invalid --user '$CFLT_USER': use only lowercase letters, digits, and internal hyphens (no dots, underscores, uppercase, or leading/trailing hyphen) - it must be valid in a cluster name and a GCP label, e.g. --user firstlast"
   # Fail fast with a clear message if the AWS session is missing/expired, rather than
   # letting some kubectl/eksctl call deep inside a subcommand fail confusingly later
   # (e.g. a stale SSO token surfacing as a kubectl port-forward or confluent CLI error).
   [[ "$CLOUD" == "aws" ]] && require_aws_identity
 fi
 
-# The real cluster name is always "<prefix>-<user>", so people sharing an AWS
-# account/region never collide on the same EKS cluster.
+# The real cluster name is always "<prefix>-<user>", so people sharing a GCP
+# project or AWS account/region never collide on the same cluster.
+[[ "$CLOUD" == "gcp" ]] && CLUSTER_NAME="${GKE_CLUSTER_NAME_PREFIX}-${CFLT_USER}"
 [[ "$CLOUD" == "aws" ]] && EKS_CLUSTER_NAME="${EKS_CLUSTER_NAME_PREFIX}-${CFLT_USER}"
 
 case "$sub" in

@@ -4,8 +4,8 @@
 Flink (CMF) demo on GKE or EKS: cluster creation, Kafka, CMF, Flink compute
 pools, and a self-contained stream-processing pipeline (create tables → seed
 data → continuous windowed aggregation). Every subcommand requires picking a
-cloud via `--gcp` or `--aws` (see below) — the rest of the pipeline (Kafka,
-CMF, Flink, the SQL demo) is identical on both.
+cloud via `--gcp` or `--aws` **and** a `--user <name>` (see below) — the rest
+of the pipeline (Kafka, CMF, Flink, the SQL demo) is identical on both.
 
 ## Prerequisites
 
@@ -15,6 +15,9 @@ Common to both clouds:
 GCP (`--gcp`):
 - `gcloud` authenticated: `gcloud auth login`
 - Access to a GCP project (default `sales-engineering-206314`, override with `PROJECT=...`)
+- A `--user <name>` (like AWS) — it names your GKE cluster (`<prefix>-<name>`)
+  and labels it `cflt_managed_by=user`, `cflt_managed_id=<name>`, so people
+  sharing a project each get their own cluster
 
 AWS (`--aws`):
 - `eksctl` and `aws` CLI v2 installed
@@ -28,17 +31,21 @@ AWS (`--aws`):
 
 ## Quick start
 
+`--user` names your cluster (`<prefix>-<name>`) and tags/labels every cloud
+resource created (`cflt_managed_by=user`, `cflt_managed_id=<name>`) on both
+clouds.
+
 ```sh
 # GCP
-./demo.sh --gcp up          # cluster, Kafka, CMF, Flink operator, environments, catalog, compute pools
-./demo.sh --gcp c3-forward   # port forward for Confluent Control Center (C3) UI; accessible on http://localhost:9021/home
-./demo.sh --gcp statement    # create tables, seed data, start the streaming aggregation job (prod)
-./demo.sh --gcp status       # check pod health and list Flink environments
-./demo.sh --gcp down         # stop port-forwards and delete the GKE cluster
+./demo.sh --gcp --user myusername up          # cluster, Kafka, CMF, Flink operator, environments, catalog, compute pools
+./demo.sh --gcp --user myusername c3-forward   # port forward for Confluent Control Center (C3) UI; accessible on http://localhost:9021/home
+./demo.sh --gcp --user myusername statement    # create tables, seed data, start the streaming aggregation job (prod)
+./demo.sh --gcp --user myusername status       # check pod health and list Flink environments
+./demo.sh --gcp --user myusername down         # stop port-forwards and delete the GKE cluster
 
-# AWS (--user tags every AWS resource created: cflt_managed_id=<name>, and is appended to the EKS cluster name)
+# AWS
 ./demo.sh --aws --user myusername up
-./demo.sh --aws --user c3-forward   # port forward for Confluent Control Center (C3) UI; accessible on http://localhost:9021/home
+./demo.sh --aws --user myusername c3-forward   # port forward for Confluent Control Center (C3) UI; accessible on http://localhost:9021/home
 ./demo.sh --aws --user myusername statement
 ./demo.sh --aws --user myusername status
 ./demo.sh --aws --user myusername down
@@ -57,23 +64,26 @@ versions) live in `config.sh` (sourced automatically by `demo.sh`) — edit
 that file directly, or override any value with an environment variable:
 
 ```sh
-PROJECT=my-proj ZONE=us-central1-a CLUSTER_NAME=my-demo ./demo.sh --gcp cluster
-EKS_REGION=us-east-1 EKS_CLUSTER_NAME_PREFIX=my-eks-demo ./demo.sh --aws --user myusername cluster
+PROJECT=my-proj ZONE=us-central1-a GKE_CLUSTER_NAME_PREFIX=my-demo ./demo.sh --gcp --user myusername cluster
+EKS_REGION=us-east-1 EKS_CLUSTER_NAME_PREFIX=my-demo ./demo.sh --aws --user myusername cluster
 ```
 
-AWS-specific defaults: `EKS_REGION` (`eu-west-1`), `EKS_CLUSTER_NAME_PREFIX`
-(`cpf-eks-demo`), `EKS_NUM_NODES` (`3`), `EKS_NODE_TYPE` (`m5.xlarge`). The
-actual EKS cluster name is always `<EKS_CLUSTER_NAME_PREFIX>-<user>` (e.g.
-`cpf-eks-demo-myusername`), so multiple people sharing the same AWS
-account/region automatically get their own cluster without needing to
-override anything themselves.
+The actual cluster name is always `<prefix>-<user>` on both clouds — GCP uses
+`GKE_CLUSTER_NAME_PREFIX` (default `cpf-gke-demo`, e.g. `cpf-gke-demo-myusername`)
+and AWS uses `EKS_CLUSTER_NAME_PREFIX` (default `cpf-eks-demo`) — so multiple
+people sharing the same GCP project or AWS account/region automatically get
+their own cluster without overriding anything.
+
+AWS-specific defaults: `EKS_REGION` (`eu-west-1`), `EKS_NUM_NODES` (`3`),
+`EKS_NODE_TYPE` (`m5.xlarge`). GCP-specific: `PROJECT`, `ZONE`
+(`europe-west1-b`), `NUM_NODES` (`3`), `MACHINE_TYPE` (`e2-standard-4`).
 
 ## Command reference
 
 Every step is also runnable standalone — e.g. after editing
-`flink/compute-pool.json`, just run `./demo.sh --gcp compute-pool` (or
-`--aws --user <name>`). All subcommands require `--gcp` or `--aws` (see
-Quick start); omitted below for brevity.
+`flink/compute-pool.json`, just run `./demo.sh --gcp --user <name> compute-pool`
+(or `--aws --user <name>`). All subcommands require a cloud (`--gcp`/`--aws`)
+and `--user <name>` (see Quick start); both are omitted below for brevity.
 
 | Subcommand | What it does |
 |---|---|
@@ -92,7 +102,7 @@ Quick start); omitted below for brevity.
 | `catalog` | Creates/updates the `kafka-cat` catalog and `kafka-db` database, with DDL permissions |
 | `compute-pool` | Creates/updates the `pool` (DEDICATED) and `shared-pool` (SHARED) compute pools |
 | `verify [env]` | Sanity-checks the environment via a disposable table (default `prod`) |
-| `statement [env]` | Runs the full stream-processing demo pipeline (default `prod`) |
+| `statement [env] [pool]` | Runs the full stream-processing demo pipeline (default `prod`). Pass a pool name to run every step on that single pool (e.g. `statement prod shared-pool`); otherwise DDL/streaming use `shared-pool` and the data load uses the DEDICATED `pool` |
 | `generate-data [env] [count] [pool]` | Inserts more random rows into `demo_events` on demand (default `prod`, `20` rows, `shared-pool`) |
 | `application [env] [file]` | Deploys a raw `FlinkApplication` (default `prod`, `cpf_basic_app.json`) |
 | `c3-forward` | Background port-forward for Control Center → `localhost:9021` |
@@ -136,7 +146,8 @@ Once `flink-statement` is running, feed it more data any time with
 
 ## Common tasks
 
-The examples below use `--gcp`; swap in `--aws --user <name>` for EKS.
+The examples below use `--gcp` and omit the now-required `--user <name>` for
+brevity — add it to each command (or use `--aws --user <name>` for EKS).
 
 **Generate more demo data.** Trigger this any time the streaming job needs
 fresh input — it inserts random rows (values 1-50, category `A`/`B`, spread
@@ -318,8 +329,8 @@ confluent flink environment list \
 ## Teardown
 
 ```sh
-./demo.sh --gcp down                         # prompts for confirmation
-./demo.sh --gcp down --yes                   # skip the prompt
+./demo.sh --gcp --user myusername down            # prompts for confirmation
+./demo.sh --gcp --user myusername down --yes      # skip the prompt
 
 ./demo.sh --aws --user myusername down          # prompts for confirmation
 ./demo.sh --aws --user myusername down --yes    # skip the prompt
