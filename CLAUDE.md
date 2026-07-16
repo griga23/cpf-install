@@ -29,6 +29,11 @@ cheatsheet, which are not duplicated here.
   version numbers should be bumped — `cp/cp.yaml` has `${..._VERSION}`
   placeholders substituted in by `render_kafka_manifest()` (sed, not
   envsubst), so never hardcode a version directly into `cp/cp.yaml`.
+  Watch the two similarly-named vars: `FLINK_NAMESPACES` (comma-separated,
+  the k8s namespaces the Flink operator watches) is distinct from
+  `FLINK_ENVIRONMENTS` (space-separated, the CMF environments `cmd_up`
+  creates and iterates `cmd_verify` over) — different delimiters, different
+  consumers.
 - `cp/cp.yaml` — CP custom resources (KRaftController, Kafka, SchemaRegistry,
   ControlCenter, Prometheus, AlertManager) applied by `cmd_kafka`.
 - `flink/*.json` — CMF resource bodies (`catalogv2.json`, `databasev2.json`,
