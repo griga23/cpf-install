@@ -28,8 +28,9 @@ require_cmds() {
 }
 
 require_aws_identity() {
+  require_cmds aws
   aws sts get-caller-identity >/dev/null 2>&1 \
-    || die "aws CLI is not authenticated (or AWS_PROFILE/credentials are invalid) - run 'aws sts get-caller-identity' to diagnose, export the correct AWS_PROFILE, and retry"
+    || die "aws CLI has no valid credentials (session expired, e.g. an SSO token, or AWS_PROFILE/credentials are wrong) - run 'aws sts get-caller-identity' to diagnose, re-authenticate (e.g. 'granted sso login ...' or re-export AWS_PROFILE), and retry"
 }
 
 # Catches a confusing failure mode: `confluent context list` can show a
@@ -144,7 +145,6 @@ cmd_cluster_gcp() {
 
 cmd_cluster_aws() {
   require_cmds eksctl aws kubectl
-  require_aws_identity
   log "Creating EKS cluster '$EKS_CLUSTER_NAME' in $EKS_REGION"
   if aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --region "$EKS_REGION" >/dev/null 2>&1; then
     warn "cluster '$EKS_CLUSTER_NAME' already exists, skipping create"
@@ -604,7 +604,6 @@ cmd_down_gcp() {
 
 cmd_down_aws() {
   require_cmds eksctl aws
-  require_aws_identity
   if [[ "${1:-}" != "--yes" ]]; then
     read -r -p "This will DELETE the EKS cluster '$EKS_CLUSTER_NAME' in $EKS_REGION. Type 'yes' to continue: " confirm
     [[ "$confirm" == "yes" ]] || { echo "Aborted."; exit 1; }
@@ -728,6 +727,10 @@ sub="${1:-help}"
 if [[ "$sub" != "help" && "$sub" != "-h" && "$sub" != "--help" ]]; then
   [[ -n "$CLOUD" ]] || die "must specify a cloud: pass exactly one of --gcp or --aws (e.g. './demo.sh --gcp up' or './demo.sh --aws --user myusername up')"
   [[ "$CLOUD" == "aws" && -z "$CFLT_USER" ]] && die "--aws requires --user <cflt-username> (the part of your @confluent.io email before the @, e.g. --user myusername)"
+  # Fail fast with a clear message if the AWS session is missing/expired, rather than
+  # letting some kubectl/eksctl call deep inside a subcommand fail confusingly later
+  # (e.g. a stale SSO token surfacing as a kubectl port-forward or confluent CLI error).
+  [[ "$CLOUD" == "aws" ]] && require_aws_identity
 fi
 
 # The real cluster name is always "<prefix>-<user>", so people sharing an AWS

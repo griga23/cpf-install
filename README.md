@@ -23,17 +23,22 @@ AWS (`--aws`):
   `demo.sh` verifies your identity before touching AWS, but never manages
   credentials or assumes roles on your behalf.
 
+> ⚠️ Make sure you are not logged into Confluent Cloud or any Confluent Platform environment from your
+> Confluent CLI, before proceeding: `confluent logout`
+
 ## Quick start
 
 ```sh
 # GCP
 ./demo.sh --gcp up          # cluster, Kafka, CMF, Flink operator, environments, catalog, compute pools
+./demo.sh --gcp c3-forward   # port forward for Confluent Control Center (C3) UI; accessible on http://localhost:9021/home
 ./demo.sh --gcp statement    # create tables, seed data, start the streaming aggregation job (prod)
 ./demo.sh --gcp status       # check pod health and list Flink environments
 ./demo.sh --gcp down         # stop port-forwards and delete the GKE cluster
 
 # AWS (--user tags every AWS resource created: cflt_managed_id=<name>, and is appended to the EKS cluster name)
 ./demo.sh --aws --user myusername up
+./demo.sh --aws --user c3-forward   # port forward for Confluent Control Center (C3) UI; accessible on http://localhost:9021/home
 ./demo.sh --aws --user myusername statement
 ./demo.sh --aws --user myusername status
 ./demo.sh --aws --user myusername down
@@ -221,6 +226,9 @@ watch kubectl get pods -n confluent
 ## CLI cheatsheet
 
 Full reference: https://docs.confluent.io/cp-flink/current/clients-api/cli.html
+
+> ⚠️ all Confluent CLI commands expect the env variable `CONFLUENT_CMF_URL` = `http://localhost:8080`.
+
 
 ```sh
 # -o json / -o yaml work on every list/describe command
