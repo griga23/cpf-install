@@ -328,7 +328,7 @@ confluent flink environment list \
 On AWS, `down` marks PVCs for deletion first, then deletes the cluster; their
 EBS volumes actually release while `eksctl` gracefully drains the nodegroup
 (pods must stop before their attached volumes can be reclaimed), and a final
-check afterward warns if any volume was somehow left behind. This takes
+check afterward retries deleting any volume left behind. This takes
 materially longer than the GCP path — typically 10-15 minutes for the full
 CloudFormation stack deletion.
 

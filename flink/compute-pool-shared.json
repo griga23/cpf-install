@@ -12,7 +12,7 @@
       "flinkConfiguration": {
         "pipeline.operator-chaining.enabled": "false",
         "execution.checkpointing.interval": "10s",
-        "taskmanager.numberOfTaskSlots": "4"
+        "taskmanager.numberOfTaskSlots": "2"
       },
       "taskManager": {
         "resource": {
