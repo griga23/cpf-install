@@ -250,6 +250,16 @@ cmd_c3_forward() {
   log "Control Center reachable at http://localhost:${C3_LOCAL_PORT}/home"
 }
 
+# Convenience wrapper around the CMF port-forward that frames it as the CMF 2.4
+# web UI (served at the root of the CMF service, same port as the REST API) and
+# opens it in a browser where possible.
+cmd_cmf_ui() {
+  ensure_cmf_port_forward
+  local url="${CONFLUENT_CMF_URL}/"
+  log "CMF web UI: ${url}  (REST API: ${CONFLUENT_CMF_URL}/cmf/api/v1)"
+  command -v open >/dev/null 2>&1 && open "$url" >/dev/null 2>&1 || true
+}
+
 cmd_cert_manager() {
   log "Installing cert-manager $CERT_MANAGER_VERSION"
   kubectl apply -f "https://github.com/jetstack/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
@@ -271,9 +281,25 @@ cmd_flink_operator() {
 
 cmd_cmf() {
   log "Installing Confluent Manager for Apache Flink (CMF) $CMF_VERSION"
+  # Feature flags (see config.sh). Each --set maps to an exact chart value path;
+  # CMF 2.4 validates the values schema, so an unknown key fails the upgrade.
+  local set_args=(
+    --set cmf.sql.production=false
+    --set cmf.sql.environmentCatalog.enabled="$CMF_ENVIRONMENT_CATALOG_ENABLED"
+    --set cmf.mcp.enabled="$CMF_MCP_ENABLED"
+    --set cmf.mcp.writeTools.enabled="$CMF_MCP_WRITE_TOOLS_ENABLED"
+    --set cmf.stackTraceLogging="$CMF_STACKTRACE_LOGGING"
+  )
+  # Artifact management refuses to start without a basePath, so only enable it
+  # when one is configured (--set-string keeps the s3://... URI intact).
+  if [[ "$CMF_ARTIFACTS_ENABLED" == "true" ]]; then
+    [[ -n "$CMF_ARTIFACTS_BASE_PATH" ]] || die "CMF_ARTIFACTS_ENABLED=true requires CMF_ARTIFACTS_BASE_PATH (e.g. s3://bucket/cmf, gs://bucket/cmf) - CMF won't start otherwise"
+    set_args+=( --set cmf.artifacts.enabled=true --set-string "cmf.artifacts.basePath=${CMF_ARTIFACTS_BASE_PATH}" )
+  fi
+  log "CMF feature flags: environmentCatalog=$CMF_ENVIRONMENT_CATALOG_ENABLED mcp=$CMF_MCP_ENABLED (writeTools=$CMF_MCP_WRITE_TOOLS_ENABLED) artifacts=$CMF_ARTIFACTS_ENABLED"
   helm upgrade --install cmf confluentinc/confluent-manager-for-apache-flink \
     --version "$CMF_VERSION" \
-    --set cmf.sql.production=false \
+    "${set_args[@]}" \
     --namespace "$CONFLUENT_NAMESPACE"
   wait_pods_ready "$CONFLUENT_NAMESPACE" 180s
 }
@@ -735,6 +761,8 @@ Individual steps (same order as `up`):
 
 Utilities:
   c3-forward              Start a background port-forward to Control Center on :9021
+  cmf-ui                  Ensure the CMF port-forward and open the CMF 2.4 web UI
+                          (served at the root of :8080, same port as the REST API)
   status                  Show pod status and Flink environments
   help                    Show this message
 
@@ -810,6 +838,7 @@ case "$sub" in
   operator) cmd_operator "$@" ;;
   kafka) cmd_kafka "$@" ;;
   c3-forward) cmd_c3_forward "$@" ;;
+  cmf-ui) cmd_cmf_ui "$@" ;;
   cert-manager) cmd_cert_manager "$@" ;;
   flink-operator) cmd_flink_operator "$@" ;;
   cmf) cmd_cmf "$@" ;;

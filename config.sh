@@ -32,9 +32,28 @@
 : "${FLINK_ENVIRONMENTS:=prod test}"             # CMF environments to create (space separated)
 
 # --- Helm chart versions ---
+# NOTE: CMF and the Flink k8s operator are version-locked - CMF 2.4.0 requires
+# operator app version 1.15.0-cp2, which is helm CHART version 1.150.x (the chart
+# and app versions differ: chart 1.150.2 -> app 1.15.0-cp2). Bump both together.
 : "${CERT_MANAGER_VERSION:=v1.18.2}"
-: "${FLINK_OPERATOR_VERSION:=~1.140.0}"
-: "${CMF_VERSION:=~2.3.1}"
+: "${FLINK_OPERATOR_VERSION:=~1.150.0}"   # chart 1.150.x = app 1.15.0-cp2 (required by CMF 2.4.0)
+: "${CMF_VERSION:=~2.4.0}"
+
+# --- CMF 2.4 feature flags (wired into cmd_cmf as helm --set) ---
+# Each key below maps to an EXACT chart value path - CMF 2.4 validates the Helm
+# values schema, so an unknown key fails the upgrade. Verify against:
+#   helm show values confluentinc/confluent-manager-for-apache-flink --version 2.4.0
+# Self-contained features default ON so a fresh `cmf` run exercises 2.4; set to
+# false to opt out.
+: "${CMF_ENVIRONMENT_CATALOG_ENABLED:=true}"   # cmf.sql.environmentCatalog.enabled - CREATE FUNCTION ... USING JAR + custom connectors/formats (CREATE TABLE ... WITH ('connector'=...))
+: "${CMF_MCP_ENABLED:=true}"                    # cmf.mcp.enabled - MCP server at /cmf/mcp/v1alpha1 for AI agents (Claude Code, Cursor)
+: "${CMF_MCP_WRITE_TOOLS_ENABLED:=false}"       # cmf.mcp.writeTools.enabled - allow MCP create/update/delete (false = read-only)
+: "${CMF_STACKTRACE_LOGGING:=true}"             # cmf.stackTraceLogging - log stack traces on error (2.4 default true)
+# Artifact management (upload Flink JARs to blob storage, reference via cmf://).
+# OFF by default: enabling it REQUIRES a basePath or CMF refuses to start, so set
+# BOTH of the following to turn it on.
+: "${CMF_ARTIFACTS_ENABLED:=false}"             # cmf.artifacts.enabled
+: "${CMF_ARTIFACTS_BASE_PATH:=}"                # cmf.artifacts.basePath - e.g. s3://bucket/cmf, gs://bucket/cmf, abfs://container@account.dfs.core.windows.net/cmf
 
 # --- Container image versions for cp/cp.yaml ---
 # demo.sh renders these into the manifest before applying it (see cmd_kafka),

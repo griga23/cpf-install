@@ -78,6 +78,25 @@ AWS-specific defaults: `EKS_REGION` (`eu-west-1`), `EKS_NUM_NODES` (`3`),
 `EKS_NODE_TYPE` (`m5.xlarge`). GCP-specific: `PROJECT`, `ZONE`
 (`europe-west1-b`), `NUM_NODES` (`3`), `MACHINE_TYPE` (`e2-standard-4`).
 
+### CMF 2.4 feature flags
+
+`cmd_cmf` wires the CMF 2.4 opt-in features as helm `--set` flags, controlled
+from `config.sh` (each maps to an exact chart value path — CMF 2.4 validates the
+values schema, so a wrong key fails the upgrade):
+
+| Env var | Default | Chart value |
+|---|---|---|
+| `CMF_ENVIRONMENT_CATALOG_ENABLED` | `true` | `cmf.sql.environmentCatalog.enabled` — `CREATE FUNCTION ... USING JAR` + custom `connector`/`format` tables |
+| `CMF_MCP_ENABLED` | `true` | `cmf.mcp.enabled` — MCP server at `/cmf/mcp/v1alpha1` for AI agents |
+| `CMF_MCP_WRITE_TOOLS_ENABLED` | `false` | `cmf.mcp.writeTools.enabled` — MCP create/update/delete (`false` = read-only) |
+| `CMF_STACKTRACE_LOGGING` | `true` | `cmf.stackTraceLogging` |
+| `CMF_ARTIFACTS_ENABLED` | `false` | `cmf.artifacts.enabled` — JAR upload to blob storage; **requires** `CMF_ARTIFACTS_BASE_PATH` (e.g. `s3://bucket/cmf`), or CMF won't start |
+| `CMF_ARTIFACTS_BASE_PATH` | _(unset)_ | `cmf.artifacts.basePath` |
+
+The two self-contained features (`environmentCatalog`, `mcp`) default on so a
+fresh `cmf` run exercises 2.4; export the var as `false` to opt out. Managing
+Flink via Control Center is deprecated in 2.4 in favor of the built-in CMF UI.
+
 ## Command reference
 
 Every step is also runnable standalone — e.g. after editing
@@ -106,6 +125,7 @@ and `--user <name>` (see Quick start); both are omitted below for brevity.
 | `generate-data [env] [count] [pool]` | Inserts more random rows into `demo_events` on demand (default `prod`, `20` rows, `shared-pool`) |
 | `application [env] [file]` | Deploys a raw `FlinkApplication` (default `prod`, `cpf_basic_app.json`) |
 | `c3-forward` | Background port-forward for Control Center → `localhost:9021` |
+| `cmf-ui` | Ensures the CMF port-forward and opens the CMF 2.4 web UI (root of `localhost:8080`, same port as the REST API) |
 | `status` | Shows pod health, Flink environments, and port-forward status |
 | `down [--yes]` | Stops port-forwards, deletes the GKE/EKS cluster. On AWS, PVCs are marked for deletion first, then their EBS volumes actually release as `eksctl` drains the nodegroup; a final check warns about any leftover volume |
 
