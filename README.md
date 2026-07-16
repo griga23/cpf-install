@@ -1,24 +1,52 @@
-# Confluent Platform for Flink — GKE Demo Environment
+# Confluent Platform for Flink — GKE/EKS Demo Environment
 
 `demo.sh` automates a full Confluent Platform + Confluent Manager for Apache
-Flink (CMF) demo on GKE: cluster creation, Kafka, CMF, Flink compute pools,
-and a self-contained stream-processing pipeline (create tables → seed data →
-continuous windowed aggregation).
+Flink (CMF) demo on GKE or EKS: cluster creation, Kafka, CMF, Flink compute
+pools, and a self-contained stream-processing pipeline (create tables → seed
+data → continuous windowed aggregation). Every subcommand requires picking a
+cloud via `--gcp` or `--aws` (see below) — the rest of the pipeline (Kafka,
+CMF, Flink, the SQL demo) is identical on both.
 
 ## Prerequisites
 
-- `gcloud` authenticated: `gcloud auth login`
+Common to both clouds:
 - `kubectl`, `helm`, `confluent` CLI, `curl`, `jq` installed
+
+GCP (`--gcp`):
+- `gcloud` authenticated: `gcloud auth login`
 - Access to a GCP project (default `sales-engineering-206314`, override with `PROJECT=...`)
+
+AWS (`--aws`):
+- `eksctl` and `aws` CLI v2 installed
+- Assume the correct AWS profile yourself before running `demo.sh` — e.g.
+  `export AWS_PROFILE=...` — and confirm it works with `aws sts get-caller-identity`.
+  `demo.sh` verifies your identity before touching AWS, but never manages
+  credentials or assumes roles on your behalf.
+
+> ⚠️ Make sure you are not logged into Confluent Cloud or any Confluent Platform environment from your
+> Confluent CLI, before proceeding: `confluent logout`
 
 ## Quick start
 
 ```sh
-./demo.sh up          # cluster, Kafka, CMF, Flink operator, environments, catalog, compute pools
-./demo.sh statement    # create tables, seed data, start the streaming aggregation job (prod)
-./demo.sh status       # check pod health and list Flink environments
-./demo.sh down         # stop port-forwards and delete the GKE cluster
+# GCP
+./demo.sh --gcp up          # cluster, Kafka, CMF, Flink operator, environments, catalog, compute pools
+./demo.sh --gcp c3-forward   # port forward for Confluent Control Center (C3) UI; accessible on http://localhost:9021/home
+./demo.sh --gcp statement    # create tables, seed data, start the streaming aggregation job (prod)
+./demo.sh --gcp status       # check pod health and list Flink environments
+./demo.sh --gcp down         # stop port-forwards and delete the GKE cluster
+
+# AWS (--user tags every AWS resource created: cflt_managed_id=<name>, and is appended to the EKS cluster name)
+./demo.sh --aws --user myusername up
+./demo.sh --aws --user c3-forward   # port forward for Confluent Control Center (C3) UI; accessible on http://localhost:9021/home
+./demo.sh --aws --user myusername statement
+./demo.sh --aws --user myusername status
+./demo.sh --aws --user myusername down
 ```
+
+`--gcp`/`--aws` and `--user` may appear anywhere on the command line (before
+or after the subcommand). They're required for every subcommand except
+`help`/`-h`/`--help`.
 
 Run `./demo.sh help` any time for the full subcommand list.
 
@@ -29,18 +57,28 @@ versions) live in `config.sh` (sourced automatically by `demo.sh`) — edit
 that file directly, or override any value with an environment variable:
 
 ```sh
-PROJECT=my-proj ZONE=us-central1-a CLUSTER_NAME=my-demo ./demo.sh cluster
+PROJECT=my-proj ZONE=us-central1-a CLUSTER_NAME=my-demo ./demo.sh --gcp cluster
+EKS_REGION=us-east-1 EKS_CLUSTER_NAME_PREFIX=my-eks-demo ./demo.sh --aws --user myusername cluster
 ```
+
+AWS-specific defaults: `EKS_REGION` (`eu-west-1`), `EKS_CLUSTER_NAME_PREFIX`
+(`cpf-eks-demo`), `EKS_NUM_NODES` (`3`), `EKS_NODE_TYPE` (`m5.xlarge`). The
+actual EKS cluster name is always `<EKS_CLUSTER_NAME_PREFIX>-<user>` (e.g.
+`cpf-eks-demo-myusername`), so multiple people sharing the same AWS
+account/region automatically get their own cluster without needing to
+override anything themselves.
 
 ## Command reference
 
 Every step is also runnable standalone — e.g. after editing
-`flink/compute-pool.json`, just run `./demo.sh compute-pool`.
+`flink/compute-pool.json`, just run `./demo.sh --gcp compute-pool` (or
+`--aws --user <name>`). All subcommands require `--gcp` or `--aws` (see
+Quick start); omitted below for brevity.
 
 | Subcommand | What it does |
 |---|---|
 | `up` | Runs everything below, in order |
-| `cluster` | Creates the GKE cluster, fetches `kubectl` credentials |
+| `cluster` | Creates the GKE/EKS cluster, fetches `kubectl` credentials. On AWS, also installs the EBS CSI driver add-on + a default `gp3` `StorageClass` (GKE ships with a default StorageClass already) |
 | `helm-repo` | Adds/updates the `confluentinc` helm repo |
 | `namespace` | Creates the `confluent` namespace, sets it as default context |
 | `operator` | Installs the `confluent-for-kubernetes` operator |
@@ -59,7 +97,7 @@ Every step is also runnable standalone — e.g. after editing
 | `application [env] [file]` | Deploys a raw `FlinkApplication` (default `prod`, `cpf_basic_app.json`) |
 | `c3-forward` | Background port-forward for Control Center → `localhost:9021` |
 | `status` | Shows pod health, Flink environments, and port-forward status |
-| `down [--yes]` | Stops port-forwards, deletes the GKE cluster |
+| `down [--yes]` | Stops port-forwards, deletes the GKE/EKS cluster. On AWS, PVCs are marked for deletion first, then their EBS volumes actually release as `eksctl` drains the nodegroup; a final check warns about any leftover volume |
 
 ## The demo pipeline
 
@@ -98,17 +136,19 @@ Once `flink-statement` is running, feed it more data any time with
 
 ## Common tasks
 
+The examples below use `--gcp`; swap in `--aws --user <name>` for EKS.
+
 **Generate more demo data.** Trigger this any time the streaming job needs
 fresh input — it inserts random rows (values 1-50, category `A`/`B`, spread
 over the last 90s), then cleans up the one-shot statement it used:
 
 ```sh
-./demo.sh generate-data prod            # 20 rows (default) on shared-pool - fast, ~10s
-./demo.sh generate-data prod 100        # specify a row count
-./demo.sh generate-data prod 20 pool    # use the DEDICATED pool instead - slower (~1-2 min
-                                         # cold start), but confirms COMPLETED; shared-pool
-                                         # can't (see Troubleshooting), so this just fires
-                                         # the insert and moves on after a short grace period
+./demo.sh --gcp generate-data prod            # 20 rows (default) on shared-pool - fast, ~10s
+./demo.sh --gcp generate-data prod 100        # specify a row count
+./demo.sh --gcp generate-data prod 20 pool    # use the DEDICATED pool instead - slower (~1-2 min
+                                               # cold start), but confirms COMPLETED; shared-pool
+                                               # can't (see Troubleshooting), so this just fires
+                                               # the insert and moves on after a short grace period
 ```
 
 **Check the aggregation results.** A plain `SELECT * FROM demo_aggregated`
@@ -133,7 +173,7 @@ confluent --environment prod flink statement delete check-agg --force
 **Open Control Center:**
 
 ```sh
-./demo.sh c3-forward
+./demo.sh --gcp c3-forward
 open http://localhost:9021/home
 ```
 
@@ -156,15 +196,15 @@ confluent --environment prod flink statement delete flink-statement --force
 **Deploy the sample FlinkApplication** (`StateMachineExample.jar`):
 
 ```sh
-./demo.sh application prod
-./demo.sh application test cpf3.json    # or point at a different resource file
+./demo.sh --gcp application prod
+./demo.sh --gcp application test cpf3.json    # or point at a different resource file
 ```
 
 **Resize a compute pool:** edit `flink/compute-pool.json` or
 `flink/compute-pool-shared.json`, then:
 
 ```sh
-./demo.sh compute-pool
+./demo.sh --gcp compute-pool
 ```
 
 (A `SHARED` pool can't resize while it has active statements — stop/delete
@@ -173,8 +213,8 @@ them first: `confluent --environment <env> flink statement stop <name>`.)
 **Restart a dead port-forward:**
 
 ```sh
-./demo.sh port-forward      # CMF, localhost:8080
-./demo.sh c3-forward        # Control Center, localhost:9021
+./demo.sh --gcp port-forward      # CMF, localhost:8080
+./demo.sh --gcp c3-forward        # Control Center, localhost:9021
 ```
 
 **Watch pods come up during install:**
@@ -186,6 +226,9 @@ watch kubectl get pods -n confluent
 ## CLI cheatsheet
 
 Full reference: https://docs.confluent.io/cp-flink/current/clients-api/cli.html
+
+> ⚠️ all Confluent CLI commands expect the env variable `CONFLUENT_CMF_URL` = `http://localhost:8080`.
+
 
 ```sh
 # -o json / -o yaml work on every list/describe command
@@ -260,20 +303,33 @@ confluent flink environment list \
 | Symptom | Fix |
 |---|---|
 | `up` hangs on a wait step | Check `kubectl -n confluent get pods`, re-run the subcommand once healthy |
-| `confluent flink ...` connection error | CMF port-forward died — run `./demo.sh port-forward` |
-| DDL fails but `SELECT`/`INSERT` work | `ddlEnvironments` missing the environment — re-run `./demo.sh catalog` |
+| `confluent flink ...` connection error | CMF port-forward died — run `./demo.sh --gcp port-forward` (or `--aws --user <name>`) |
+| DDL fails but `SELECT`/`INSERT` work | `ddlEnvironments` missing the environment — re-run `./demo.sh --gcp catalog` (or `--aws --user <name>`) |
 | Pod stuck `Pending` (`Insufficient cpu`) despite low `kubectl top nodes` usage | K8s schedules on CPU *requests*, not usage — lower `cpu` in the pool/app JSON, or bump `NUM_NODES`/`MACHINE_TYPE` |
 | Job crash-loops with a Kafka transaction timeout error | Add `/*+ OPTIONS('properties.transaction.timeout.ms'='300000') */` after `INSERT INTO` |
 | Bounded `INSERT`/`SELECT` on `shared-pool` stuck `PENDING`/`RUNNING` forever | Operator bug — run bounded/one-shot work on the DEDICATED `pool` instead |
 | `--wait` times out or is missing result data | Don't use `--wait`; poll `.status.phase` and fetch rows from `.../statements/<name>/results` |
 | `SHARED` pool won't resize (`409`) | Stop active statements first: `confluent --environment <env> flink statement stop <name>` |
 | Compute pool `PUT` returns 200 but pods unchanged | Wait a few seconds — the operator redeploys asynchronously |
+| EKS pods stuck `Pending` with unbound PVCs (Kafka/SR/Control Center) | The EBS CSI driver/default `gp3` `StorageClass` didn't finish setting up — check `kubectl -n kube-system get pods -l app=ebs-csi-controller` and `kubectl get storageclass` (expect `gp3` marked `(default)`); re-run `./demo.sh --aws --user <name> cluster` to retry (idempotent) |
+| `aws`/`eksctl` commands fail with an auth error | Your assumed AWS profile expired or isn't set — re-run `export AWS_PROFILE=...` and confirm with `aws sts get-caller-identity` before retrying |
+| `confluent flink ...` fails with `Error: not logged in`, even though `confluent context list` shows a current context | That context's session token is stale/corrupted. This is unrelated to which cloud/CMF instance you're using — `confluent flink ...` commands talk to CMF purely via `CONFLUENT_CMF_URL`/`--url`, never through the login's own target. Fix: `confluent context list`, delete the broken context(s) with `confluent context delete <name>`, then `confluent login --save` (any login works — Confluent Cloud or Platform) and retry |
 
 ## Teardown
 
 ```sh
-./demo.sh down          # prompts for confirmation
-./demo.sh down --yes    # skip the prompt
+./demo.sh --gcp down                         # prompts for confirmation
+./demo.sh --gcp down --yes                   # skip the prompt
+
+./demo.sh --aws --user myusername down          # prompts for confirmation
+./demo.sh --aws --user myusername down --yes    # skip the prompt
 ```
+
+On AWS, `down` marks PVCs for deletion first, then deletes the cluster; their
+EBS volumes actually release while `eksctl` gracefully drains the nodegroup
+(pods must stop before their attached volumes can be reclaimed), and a final
+check afterward retries deleting any volume left behind. This takes
+materially longer than the GCP path — typically 10-15 minutes for the full
+CloudFormation stack deletion.
 
 Also stops any background port-forwards started by this script...

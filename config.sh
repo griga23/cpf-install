@@ -13,6 +13,17 @@
 : "${NUM_NODES:=3}"
 : "${MACHINE_TYPE:=e2-standard-4}"
 
+# --- EKS cluster (AWS) ---
+# Deliberately NOT named AWS_REGION: that's also the standard AWS CLI/SDK
+# environment variable, so if it's already set in your shell (common with
+# AWS SSO/profile setups) it would silently win over the default below.
+: "${EKS_REGION:=eu-west-1}"
+# The actual cluster name is always "<prefix>-<cflt-username>" (see demo.sh),
+# so people sharing an AWS account/region never collide on the same cluster.
+: "${EKS_CLUSTER_NAME_PREFIX:=cpf-eks-demo}"
+: "${EKS_NUM_NODES:=3}"
+: "${EKS_NODE_TYPE:=m5.xlarge}"
+
 # --- Kubernetes namespaces / Flink environments ---
 : "${CONFLUENT_NAMESPACE:=confluent}"
 : "${FLINK_NAMESPACES:=confluent,test,prod}"     # watched by the Flink k8s operator
