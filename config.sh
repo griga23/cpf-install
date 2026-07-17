@@ -19,7 +19,9 @@
 # Deliberately NOT named AWS_REGION: that's also the standard AWS CLI/SDK
 # environment variable, so if it's already set in your shell (common with
 # AWS SSO/profile setups) it would silently win over the default below.
-: "${EKS_REGION:=eu-west-1}"
+# eu-central-1 (not eu-west-1) because the shared account's eu-west-1 is at its
+# per-AZ NAT-gateway quota, which makes eksctl cluster creation fail.
+: "${EKS_REGION:=eu-central-1}"
 # The actual cluster name is always "<prefix>-<cflt-username>" (see demo.sh),
 # so people sharing an AWS account/region never collide on the same cluster.
 : "${EKS_CLUSTER_NAME_PREFIX:=cpf-eks-demo}"
@@ -52,8 +54,28 @@
 # Artifact management (upload Flink JARs to blob storage, reference via cmf://).
 # OFF by default: enabling it REQUIRES a basePath or CMF refuses to start, so set
 # BOTH of the following to turn it on.
-: "${CMF_ARTIFACTS_ENABLED:=false}"             # cmf.artifacts.enabled
-: "${CMF_ARTIFACTS_BASE_PATH:=}"                # cmf.artifacts.basePath - e.g. s3://bucket/cmf, gs://bucket/cmf, abfs://container@account.dfs.core.windows.net/cmf
+: "${CMF_ARTIFACTS_ENABLED:=false}"             # cmf.artifacts.enabled - opt-in; when true, `up` also runs cmd_artifacts (creates bucket + creds) before cmf
+: "${CMF_ARTIFACTS_BASE_PATH:=}"                # cmf.artifacts.basePath - leave empty to derive as <scheme>://<bucket>/cmf (see demo.sh); override to bring your own path
+
+# --- CMF artifact storage (blob storage the script provisions per user) ---
+# Bucket + credentials are only created when CMF_ARTIFACTS_ENABLED=true. The bucket
+# name is always "<prefix>-<cflt-username>" (like the cluster), and the script mints
+# scoped static credentials (AWS IAM user + access key / GCP service account + JSON
+# key) stored in the K8s secret below. All of this is torn down by `down`.
+: "${ARTIFACTS_BUCKET_PREFIX:=cpf-artifacts}"   # bucket = <prefix>-<user> (also the AWS IAM user / GCP SA id, so keep it short: SA id must be <=30 chars)
+: "${ARTIFACTS_GCS_LOCATION:=${ZONE%-*}}"       # GCS bucket location - region derived from ZONE (europe-west1-b -> europe-west1)
+: "${ARTIFACTS_MAX_UPLOAD_SIZE:=250MB}"         # cmf.artifacts.maxUploadSize (B/KB/MB/GB/TB)
+: "${ARTIFACTS_CREDS_SECRET:=cmf-artifacts-creds}"  # K8s secret (namespace $CONFLUENT_NAMESPACE) holding the storage credentials
+# GCP only: reuse an existing service account instead of minting one (e.g. when the
+# project is at its SA-per-project quota). When set, cmd_artifacts_gcp grants this SA
+# objectAdmin on the bucket and mints a JSON key for it rather than creating a new SA.
+: "${ARTIFACTS_GCS_SA:=}"                        # existing SA email, e.g. me@<project>.iam.gserviceaccount.com
+# Flink built-in filesystem plugin enabled on the Flink cluster so it can fetch cmf://
+# artifacts itself (CMF does NOT pass its creds to the cluster). The jar name tracks the
+# Flink image tag (cp-flink-sql:1.19-cp8 -> ...-1.19-cp8.jar); verified via
+# `ls /opt/flink/opt` in the image. Bump alongside the image.
+: "${ARTIFACTS_S3_PLUGIN_JAR:=flink-s3-fs-hadoop-1.19-cp8.jar}"
+: "${ARTIFACTS_GCS_PLUGIN_JAR:=flink-gs-fs-hadoop-1.19-cp8.jar}"
 
 # --- Container image versions for cp/cp.yaml ---
 # demo.sh renders these into the manifest before applying it (see cmd_kafka),

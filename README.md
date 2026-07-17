@@ -38,6 +38,7 @@ clouds.
 ```sh
 # GCP
 ./demo.sh --gcp --user myusername up          # cluster, Kafka, CMF, Flink operator, environments, catalog, compute pools
+./demo.sh --gcp --user myusername cmf-ui       # open the CMF 2.4 web UI (http://localhost:8080/)
 ./demo.sh --gcp --user myusername c3-forward   # port forward for Confluent Control Center (C3) UI; accessible on http://localhost:9021/home
 ./demo.sh --gcp --user myusername statement    # create tables, seed data, start the streaming aggregation job (prod)
 ./demo.sh --gcp --user myusername status       # check pod health and list Flink environments
@@ -45,10 +46,22 @@ clouds.
 
 # AWS
 ./demo.sh --aws --user myusername up
+./demo.sh --aws --user myusername cmf-ui       # open the CMF 2.4 web UI (http://localhost:8080/)
 ./demo.sh --aws --user myusername c3-forward   # port forward for Confluent Control Center (C3) UI; accessible on http://localhost:9021/home
 ./demo.sh --aws --user myusername statement
 ./demo.sh --aws --user myusername status
 ./demo.sh --aws --user myusername down
+```
+
+**With CMF 2.4 artifact storage.** Set `CMF_ARTIFACTS_ENABLED=true` to also
+provision blob storage (a per-user bucket + scoped creds) and wire it into CMF
+and the Flink pools during `up`; `down` cleans it up. See
+[Artifact storage](#artifact-storage-cmf-24) for details.
+
+```sh
+CMF_ARTIFACTS_ENABLED=true ./demo.sh --aws --user myusername up   # up, plus S3 bucket + IAM user/creds
+# GCP shared projects are often at their service-account quota - reuse an existing SA:
+CMF_ARTIFACTS_ENABLED=true ARTIFACTS_GCS_SA=<existing-sa-email> ./demo.sh --gcp --user myusername up
 ```
 
 `--gcp`/`--aws` and `--user` may appear anywhere on the command line (before
@@ -74,7 +87,8 @@ and AWS uses `EKS_CLUSTER_NAME_PREFIX` (default `cpf-eks-demo`) — so multiple
 people sharing the same GCP project or AWS account/region automatically get
 their own cluster without overriding anything.
 
-AWS-specific defaults: `EKS_REGION` (`eu-west-1`), `EKS_NUM_NODES` (`3`),
+AWS-specific defaults: `EKS_REGION` (`eu-central-1` — the shared account's
+`eu-west-1` is at its per-AZ NAT-gateway quota, which fails eksctl), `EKS_NUM_NODES` (`3`),
 `EKS_NODE_TYPE` (`m5.xlarge`). GCP-specific: `PROJECT`, `ZONE`
 (`europe-west1-b`), `NUM_NODES` (`3`), `MACHINE_TYPE` (`e2-standard-4`).
 
@@ -90,12 +104,49 @@ values schema, so a wrong key fails the upgrade):
 | `CMF_MCP_ENABLED` | `true` | `cmf.mcp.enabled` — MCP server at `/cmf/mcp/v1alpha1` for AI agents |
 | `CMF_MCP_WRITE_TOOLS_ENABLED` | `false` | `cmf.mcp.writeTools.enabled` — MCP create/update/delete (`false` = read-only) |
 | `CMF_STACKTRACE_LOGGING` | `true` | `cmf.stackTraceLogging` |
-| `CMF_ARTIFACTS_ENABLED` | `false` | `cmf.artifacts.enabled` — JAR upload to blob storage; **requires** `CMF_ARTIFACTS_BASE_PATH` (e.g. `s3://bucket/cmf`), or CMF won't start |
-| `CMF_ARTIFACTS_BASE_PATH` | _(unset)_ | `cmf.artifacts.basePath` |
+| `CMF_ARTIFACTS_ENABLED` | `false` | `cmf.artifacts.enabled` — provision blob storage + wire it in (see [Artifact storage](#artifact-storage-cmf-24)) |
+| `CMF_ARTIFACTS_BASE_PATH` | _(auto)_ | `cmf.artifacts.basePath` — auto-derived as `<scheme>://cpf-artifacts-<user>/cmf`; set it only to bring your own path |
 
 The two self-contained features (`environmentCatalog`, `mcp`) default on so a
 fresh `cmf` run exercises 2.4; export the var as `false` to opt out. Managing
 Flink via Control Center is deprecated in 2.4 in favor of the built-in CMF UI.
+
+### Artifact storage (CMF 2.4)
+
+Artifact management (upload/version Flink JARs to blob storage, reference via
+`cmf://`) is **opt-in** and works on both clouds. Enable it with
+`CMF_ARTIFACTS_ENABLED=true`; the `artifacts` step (run automatically by `up`
+before `cmf`) provisions everything and `down` tears it back down:
+
+- A per-user bucket **`cpf-artifacts-<user>`** (GCS on GCP, S3 on AWS).
+- **Script-minted, bucket-scoped static credentials** — an AWS IAM user + access
+  key, or a GCP service account + JSON key — stored in the K8s secret
+  `cmf-artifacts-creds` in the `confluent` namespace and replicated to each Flink
+  environment namespace (`prod`/`test`), since the Flink clusters fetch artifacts
+  themselves.
+- CMF is wired to those creds (`cmf.artifacts.*` + `extraEnv`/`mountedVolumes`),
+  and the Flink compute pools / applications get their **own** filesystem access
+  (plugin + creds) injected into their specs, since CMF does not pass its
+  artifact credentials to the Flink clusters.
+
+```sh
+CMF_ARTIFACTS_ENABLED=true ./demo.sh --gcp --user <name> up          # bucket+creds created before cmf
+CMF_ARTIFACTS_ENABLED=true ./demo.sh --aws --user <name> artifacts   # or provision the storage standalone
+```
+
+**Shared GCP projects:** minting a new service account can fail if the project is at
+its service-account quota (common on shared projects). Set
+`ARTIFACTS_GCS_SA=<an-existing-sa-email>` to reuse an existing SA instead — the script
+grants it bucket access and mints a JSON key for it, and `down` deletes exactly that
+key (recorded on the secret) without touching the shared SA itself.
+
+Tunables (see `config.sh`): `ARTIFACTS_BUCKET_PREFIX` (default `cpf-artifacts`),
+`ARTIFACTS_GCS_LOCATION` (derived from `ZONE`), `ARTIFACTS_MAX_UPLOAD_SIZE`
+(`250MB`), `ARTIFACTS_CREDS_SECRET`, and `ARTIFACTS_S3_PLUGIN_JAR` /
+`ARTIFACTS_GCS_PLUGIN_JAR` (the Flink built-in filesystem plugin — must match the
+Flink image; verify with `ls /opt/flink/opt`). Override `CMF_ARTIFACTS_BASE_PATH`
+to bring your own path. Minting IAM users / SA keys may be blocked by org policy —
+the step fails with a clear message if so.
 
 ## Command reference
 
@@ -115,13 +166,14 @@ and `--user <name>` (see Quick start); both are omitted below for brevity.
 | `cert-manager` | Installs cert-manager (required by the Flink Kubernetes Operator) |
 | `flink-operator` | Creates `prod`/`test` namespaces, installs the Flink Kubernetes Operator |
 | `cmf` | Installs Confluent Manager for Apache Flink |
+| `artifacts` | Provisions blob storage for CMF 2.4 artifacts: a per-user bucket + scoped static creds in a K8s secret. Only runs when `CMF_ARTIFACTS_ENABLED=true` (and `up` runs it automatically before `cmf`) |
 | `port-forward` | Background port-forward `cmf-service` → `localhost:8080` |
 | `stop-port-forward` | Stops all background port-forwards started by this script |
 | `flink-environments` | Creates the `prod`/`test` CMF environments |
 | `catalog` | Creates/updates the `kafka-cat` catalog and `kafka-db` database, with DDL permissions |
 | `compute-pool` | Creates/updates the `pool` (DEDICATED) and `shared-pool` (SHARED) compute pools |
 | `verify [env]` | Sanity-checks the environment via a disposable table (default `prod`) |
-| `statement [env] [pool]` | Runs the full stream-processing demo pipeline (default `prod`). Pass a pool name to run every step on that single pool (e.g. `statement prod shared-pool`); otherwise DDL/streaming use `shared-pool` and the data load uses the DEDICATED `pool` |
+| `statement [env] [pool]` | Runs the full stream-processing demo pipeline (default `prod`). By default every step runs on `shared-pool` (fast — no cold start); pass a pool name to force a different pool for all steps (e.g. `statement prod pool` runs the data load on the DEDICATED `pool`, which confirms COMPLETED but is slower) |
 | `generate-data [env] [count] [pool]` | Inserts more random rows into `demo_events` on demand (default `prod`, `20` rows, `shared-pool`) |
 | `application [env] [file]` | Deploys a raw `FlinkApplication` (default `prod`, `cpf_basic_app.json`) |
 | `c3-forward` | Background port-forward for Control Center → `localhost:9021` |
@@ -131,26 +183,25 @@ and `--user <name>` (see Quick start); both are omitted below for brevity.
 
 ## The demo pipeline
 
-Two compute pools, used for different purposes:
+Two compute pools are available:
 
 | Pool | Type | Used for |
 |---|---|---|
-| `pool` | DEDICATED | One-shot bounded jobs (seed data insert, ad hoc bounded `SELECT`s) |
-| `shared-pool` | SHARED | DDL, ad hoc queries, and the continuous streaming job |
+| `shared-pool` | SHARED | DDL, ad hoc queries, the continuous streaming job, and (by default) the seed-data insert — fast, no per-job cold start |
+| `pool` | DEDICATED | One-shot bounded jobs where you want verifiable `COMPLETED` (bounded jobs never report finished on `shared-pool` — see [Troubleshooting](#troubleshooting)) |
 
-(Bounded jobs never report as finished on `shared-pool` — see
-[Troubleshooting](#troubleshooting) — so anything bounded runs on `pool`
-instead.)
+`./demo.sh statement [env] [pool]` runs four SQL statements in sequence against a
+self-contained schema (CMF only accepts one statement per submission, so these
+can't be combined into a single script). **By default every step runs on
+`shared-pool`** (fastest); pass a pool name to force a different pool for all
+steps — e.g. `statement prod pool` runs the bounded seed insert on the DEDICATED
+`pool` so its completion is verifiable (slower, cold start):
 
-`./demo.sh statement [env]` runs four SQL statements in sequence against a
-self-contained schema (CMF only accepts one statement per submission, so
-these can't be combined into a single script):
-
-| # | SQL file | Pool | Result |
+| # | SQL file | Pool (default) | Result |
 |---|---|---|---|
 | 1 | `sql/create_demo_events.sql` | `shared-pool` | `demo_events` table, watermarked on `event_time` |
 | 2 | `sql/create_demo_aggregated.sql` | `shared-pool` | `demo_aggregated` table for windowed results |
-| 3 | `sql/insert_demo_data.sql` | `pool` | 10 seed rows, timestamped relative to `CURRENT_TIMESTAMP` (always "fresh") |
+| 3 | `sql/insert_demo_data.sql` | `shared-pool` | 10 seed rows, timestamped relative to `CURRENT_TIMESTAMP` (always "fresh"); on `shared-pool` completion isn't verifiable, so it uses a short grace period |
 | 4 | `sql/streaming_aggregation.sql` | `shared-pool` | Continuous 30s tumbling-window aggregation, left `RUNNING` as `flink-statement` |
 
 Safe to re-run: `CREATE TABLE` uses `IF NOT EXISTS`, the seed insert just adds
@@ -342,6 +393,7 @@ confluent flink environment list \
 | `--wait` times out or is missing result data | Don't use `--wait`; poll `.status.phase` and fetch rows from `.../statements/<name>/results` |
 | `SHARED` pool won't resize (`409`) | Stop active statements first: `confluent --environment <env> flink statement stop <name>` |
 | Compute pool `PUT` returns 200 but pods unchanged | Wait a few seconds — the operator redeploys asynchronously |
+| eksctl `up` fails with `would exceed the limit of N NAT gateways` | That region's per-AZ NAT-gateway quota is full (common on shared accounts) — retry in a different region, e.g. `EKS_REGION=<other-region> ./demo.sh --aws --user <name> up`. The default is `eu-central-1`; `eu-west-1` is known to be full on the shared account |
 | EKS pods stuck `Pending` with unbound PVCs (Kafka/SR/Control Center) | The EBS CSI driver/default `gp3` `StorageClass` didn't finish setting up — check `kubectl -n kube-system get pods -l app=ebs-csi-controller` and `kubectl get storageclass` (expect `gp3` marked `(default)`); re-run `./demo.sh --aws --user <name> cluster` to retry (idempotent) |
 | `aws`/`eksctl` commands fail with an auth error | Your assumed AWS profile expired or isn't set — re-run `export AWS_PROFILE=...` and confirm with `aws sts get-caller-identity` before retrying |
 | `confluent flink ...` fails with `Error: not logged in`, even though `confluent context list` shows a current context | That context's session token is stale/corrupted. This is unrelated to which cloud/CMF instance you're using — `confluent flink ...` commands talk to CMF purely via `CONFLUENT_CMF_URL`/`--url`, never through the login's own target. Fix: `confluent context list`, delete the broken context(s) with `confluent context delete <name>`, then `confluent login --save` (any login works — Confluent Cloud or Platform) and retry |

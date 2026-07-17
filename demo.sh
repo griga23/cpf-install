@@ -279,6 +279,211 @@ cmd_flink_operator() {
   wait_pods_ready "$CONFLUENT_NAMESPACE" 180s
 }
 
+# Provisions the blob-storage bucket + scoped static credentials CMF 2.4 needs for
+# artifact management, storing the creds in the K8s secret $ARTIFACTS_CREDS_SECRET.
+# Idempotent: bucket/IAM principal creation checks-then-skips, and credentials are
+# only minted when the secret is absent (so re-runs don't hit the AWS 2-keys limit).
+cmd_artifacts() {
+  if [[ "$CMF_ARTIFACTS_ENABLED" != "true" ]]; then
+    warn "artifact storage is disabled (CMF_ARTIFACTS_ENABLED != true) - skipping"
+    return 0
+  fi
+  require_cmds kubectl
+  ensure_namespace "$CONFLUENT_NAMESPACE"
+  case "$CLOUD" in
+    gcp) cmd_artifacts_gcp ;;
+    aws) cmd_artifacts_aws ;;
+  esac
+}
+
+artifacts_secret_exists() {
+  kubectl -n "$CONFLUENT_NAMESPACE" get secret "$ARTIFACTS_CREDS_SECRET" >/dev/null 2>&1
+}
+
+# The creds secret lives in $CONFLUENT_NAMESPACE (for CMF's own upload/download), but the
+# Flink clusters that fetch cmf:// artifacts run in the environment namespaces, so the
+# secret must exist there too. Copies it from the CMF namespace into each Flink env
+# namespace (idempotent apply; strips instance metadata so it re-applies cleanly).
+replicate_artifacts_secret() {
+  require_cmds jq
+  local ns
+  for ns in $FLINK_ENVIRONMENTS; do
+    ensure_namespace "$ns"
+    kubectl -n "$CONFLUENT_NAMESPACE" get secret "$ARTIFACTS_CREDS_SECRET" -o json \
+      | jq 'del(.metadata.namespace,.metadata.resourceVersion,.metadata.uid,.metadata.creationTimestamp,.metadata.ownerReferences)' \
+      | kubectl -n "$ns" apply -f - >/dev/null
+  done
+}
+
+cmd_artifacts_aws() {
+  require_cmds aws jq
+  local user="$ARTIFACTS_BUCKET" bucket="$ARTIFACTS_BUCKET" region="$EKS_REGION" akid secret
+  log "Setting up S3 artifact storage: bucket '$bucket', IAM user '$user' (region $region)"
+
+  if aws s3api head-bucket --bucket "$bucket" --region "$region" >/dev/null 2>&1; then
+    warn "S3 bucket '$bucket' already exists, skipping create"
+  else
+    if [[ "$region" == "us-east-1" ]]; then
+      aws s3api create-bucket --bucket "$bucket" --region "$region" >/dev/null
+    else
+      aws s3api create-bucket --bucket "$bucket" --region "$region" \
+        --create-bucket-configuration "LocationConstraint=${region}" >/dev/null
+    fi
+    aws s3api put-bucket-tagging --bucket "$bucket" \
+      --tagging "TagSet=[{Key=cflt_managed_by,Value=user},{Key=cflt_managed_id,Value=${CFLT_USER}}]" >/dev/null
+  fi
+
+  if ! aws iam get-user --user-name "$user" >/dev/null 2>&1; then
+    aws iam create-user --user-name "$user" \
+      --tags "Key=cflt_managed_by,Value=user" "Key=cflt_managed_id,Value=${CFLT_USER}" >/dev/null
+  fi
+  # Scope the user to just this bucket (list on the bucket, object CRUD on its contents).
+  aws iam put-user-policy --user-name "$user" --policy-name cpf-artifacts-s3 \
+    --policy-document "$(cat <<EOF
+{"Version":"2012-10-17","Statement":[
+  {"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":"arn:aws:s3:::${bucket}"},
+  {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::${bucket}/*"}
+]}
+EOF
+)" >/dev/null
+
+  if artifacts_secret_exists; then
+    warn "secret '$ARTIFACTS_CREDS_SECRET' already exists - reusing it (not minting a new access key)"
+  else
+    log "Minting an access key for IAM user '$user' and storing it in secret '$ARTIFACTS_CREDS_SECRET'"
+    local keyjson
+    keyjson=$(aws iam create-access-key --user-name "$user") \
+      || die "could not create an access key for '$user' (org SCP may block IAM access keys) - see plan/README for the 'you supply keys' alternative"
+    akid=$(echo "$keyjson" | jq -r '.AccessKey.AccessKeyId')
+    secret=$(echo "$keyjson" | jq -r '.AccessKey.SecretAccessKey')
+    kubectl -n "$CONFLUENT_NAMESPACE" create secret generic "$ARTIFACTS_CREDS_SECRET" \
+      --from-literal=aws-access-key-id="$akid" \
+      --from-literal=aws-secret-access-key="$secret" >/dev/null
+  fi
+  replicate_artifacts_secret
+  log "S3 artifact storage ready: basePath ${CMF_ARTIFACTS_BASE_PATH}"
+}
+
+cmd_artifacts_gcp() {
+  require_cmds gcloud
+  local bucket="$ARTIFACTS_BUCKET" sa_id="$ARTIFACTS_BUCKET" sa_email keyfile
+  # Reuse an existing SA (ARTIFACTS_GCS_SA) when set - needed when the project is at
+  # its SA-per-project quota. Otherwise mint a dedicated one named after the bucket.
+  if [[ -n "$ARTIFACTS_GCS_SA" ]]; then
+    sa_email="$ARTIFACTS_GCS_SA"
+  else
+    [[ ${#sa_id} -le 30 ]] || die "artifact SA id '$sa_id' exceeds GCP's 30-char limit - shorten ARTIFACTS_BUCKET_PREFIX or --user"
+    sa_email="${sa_id}@${PROJECT}.iam.gserviceaccount.com"
+  fi
+  log "Setting up GCS artifact storage: bucket 'gs://$bucket', service account '$sa_email' (location $ARTIFACTS_GCS_LOCATION)"
+
+  if gcloud storage buckets describe "gs://${bucket}" --project "$PROJECT" >/dev/null 2>&1; then
+    warn "GCS bucket 'gs://$bucket' already exists, skipping create"
+  else
+    # `gcloud storage buckets create` has no --labels flag; apply labels via update.
+    gcloud storage buckets create "gs://${bucket}" --location="$ARTIFACTS_GCS_LOCATION" --project "$PROJECT"
+    gcloud storage buckets update "gs://${bucket}" --project "$PROJECT" \
+      --update-labels="cflt_managed_by=user,cflt_managed_id=${CFLT_USER}" >/dev/null
+  fi
+
+  if [[ -n "$ARTIFACTS_GCS_SA" ]]; then
+    gcloud iam service-accounts describe "$sa_email" --project "$PROJECT" >/dev/null 2>&1 \
+      || die "ARTIFACTS_GCS_SA '$sa_email' not found in project $PROJECT"
+  elif ! gcloud iam service-accounts describe "$sa_email" --project "$PROJECT" >/dev/null 2>&1; then
+    gcloud iam service-accounts create "$sa_id" --project "$PROJECT" \
+      --display-name "CPF artifacts ${CFLT_USER}" \
+      || die "could not create service account '$sa_id' (e.g. the project is at its service-account quota, a common case on shared projects) - set ARTIFACTS_GCS_SA=<an-existing-sa-email> to reuse an existing SA instead"
+  fi
+  gcloud storage buckets add-iam-policy-binding "gs://${bucket}" \
+    --member="serviceAccount:${sa_email}" --role=roles/storage.objectAdmin >/dev/null
+
+  if artifacts_secret_exists; then
+    warn "secret '$ARTIFACTS_CREDS_SECRET' already exists - reusing it (not minting a new SA key)"
+  else
+    log "Minting a JSON key for '$sa_email' and storing it in secret '$ARTIFACTS_CREDS_SECRET'"
+    keyfile=$(mktemp)
+    gcloud iam service-accounts keys create "$keyfile" --iam-account="$sa_email" --project "$PROJECT" \
+      || { rm -f "$keyfile"; die "could not create a JSON key for '$sa_email' (org policy may block SA key creation) - see plan/README for the 'you supply keys' alternative"; }
+    kubectl -n "$CONFLUENT_NAMESPACE" create secret generic "$ARTIFACTS_CREDS_SECRET" \
+      --from-file=gcs-key.json="$keyfile" >/dev/null
+    # Record which key we minted + on which SA, so `down` can delete exactly this key
+    # even when reusing an existing SA (where deleting the SA itself would be wrong).
+    require_cmds jq
+    kubectl -n "$CONFLUENT_NAMESPACE" annotate secret "$ARTIFACTS_CREDS_SECRET" --overwrite \
+      "cpf.artifacts/gcs-key-id=$(jq -r '.private_key_id // empty' "$keyfile")" \
+      "cpf.artifacts/gcs-sa=${sa_email}" >/dev/null
+    rm -f "$keyfile"
+  fi
+  replicate_artifacts_secret
+  log "GCS artifact storage ready: basePath ${CMF_ARTIFACTS_BASE_PATH}"
+}
+
+# Injects the Flink-cluster-side artifact storage access (filesystem plugin + creds
+# from $ARTIFACTS_CREDS_SECRET) into a Flink spec read on stdin - needed because CMF
+# does NOT pass its artifact creds to Flink clusters, so any cluster running a cmf://
+# artifact must reach storage itself. No-op (passes the spec through) unless artifacts
+# are enabled. $1 is the JSON path to the spec object to merge into (e.g. .spec.clusterSpec
+# for a ComputePool, .spec for a FlinkApplication). Uses jq (already required).
+render_flink_storage() {
+  local spec_path="$1"
+  if [[ "$CMF_ARTIFACTS_ENABLED" != "true" ]]; then cat; return 0; fi
+  local fsconf pluginjar
+  case "$CLOUD" in
+    aws)
+      pluginjar="$ARTIFACTS_S3_PLUGIN_JAR"
+      fsconf='{"s3.access-key":"${AWS_ACCESS_KEY_ID}","s3.secret-key":"${AWS_SECRET_ACCESS_KEY}"}'
+      ;;
+    gcp)
+      pluginjar="$ARTIFACTS_GCS_PLUGIN_JAR"
+      fsconf='{"gs.filesystem.credential.file":"/mnt/gcs/gcs-key.json"}'
+      ;;
+  esac
+  # Build the env / volumes the Flink main container needs. For AWS the creds come in as
+  # env vars referenced by ${..} in flinkConfiguration; for GCP the key is mounted as a file.
+  jq \
+    --arg path "$spec_path" \
+    --arg plugin "$pluginjar" \
+    --argjson fsconf "$fsconf" \
+    --arg secret "$ARTIFACTS_CREDS_SECRET" \
+    --arg cloud "$CLOUD" '
+    ($path | ltrimstr(".") | split(".")) as $p
+    | getpath($p) as $spec
+    | (($spec.flinkConfiguration // {}) + $fsconf) as $newconf
+    | (if $cloud == "aws" then
+         { env: [
+             {name:"AWS_ACCESS_KEY_ID", valueFrom:{secretKeyRef:{name:$secret, key:"aws-access-key-id"}}},
+             {name:"AWS_SECRET_ACCESS_KEY", valueFrom:{secretKeyRef:{name:$secret, key:"aws-secret-access-key"}}},
+             {name:"ENABLE_BUILT_IN_PLUGINS", value:$plugin}
+           ] }
+       else
+         { env: [ {name:"ENABLE_BUILT_IN_PLUGINS", value:$plugin} ],
+           volumeMounts: [ {name:"gcs-creds", mountPath:"/mnt/gcs", readOnly:true} ] }
+       end) as $container
+    | (if $cloud == "gcp" then
+         { spec: { containers: [ ({name:"flink-main-container"} + $container) ],
+                   volumes: [ {name:"gcs-creds", secret:{secretName:$secret}} ] } }
+       else
+         { spec: { containers: [ ({name:"flink-main-container"} + $container) ] } }
+       end) as $podTemplate
+    | setpath($p; $spec + {flinkConfiguration: $newconf, podTemplate: $podTemplate})
+  '
+}
+
+# Renders a Flink spec file through render_flink_storage into a NEW temp file that KEEPS
+# the original extension - the confluent CLI validates specs by extension (.json/.yaml/.yml)
+# and rejects an extensionless mktemp path. Prints the path to use; when artifacts are off
+# it prints the original file unchanged. Caller removes the temp file's parent dir when done.
+render_spec_to_tmp() {
+  local spec_path="$1" file="$2"
+  if [[ "$CMF_ARTIFACTS_ENABLED" != "true" ]]; then printf '%s' "$file"; return 0; fi
+  require_cmds jq
+  local d out
+  d=$(mktemp -d)
+  out="${d}/$(basename "$file")"
+  render_flink_storage "$spec_path" < "$file" > "$out"
+  printf '%s' "$out"
+}
+
 cmd_cmf() {
   log "Installing Confluent Manager for Apache Flink (CMF) $CMF_VERSION"
   # Feature flags (see config.sh). Each --set maps to an exact chart value path;
@@ -290,11 +495,46 @@ cmd_cmf() {
     --set cmf.mcp.writeTools.enabled="$CMF_MCP_WRITE_TOOLS_ENABLED"
     --set cmf.stackTraceLogging="$CMF_STACKTRACE_LOGGING"
   )
-  # Artifact management refuses to start without a basePath, so only enable it
-  # when one is configured (--set-string keeps the s3://... URI intact).
+  # Artifact management refuses to start without a basePath, so only enable it when
+  # one is configured. Credentials are read from $ARTIFACTS_CREDS_SECRET (created by
+  # cmd_artifacts) - AWS keys come in as env vars referenced by ${..} placeholders in
+  # the fs config; the GCS key is mounted as a file. Dotted fs keys are escaped so
+  # helm treats them as literal map keys, not nested paths.
   if [[ "$CMF_ARTIFACTS_ENABLED" == "true" ]]; then
     [[ -n "$CMF_ARTIFACTS_BASE_PATH" ]] || die "CMF_ARTIFACTS_ENABLED=true requires CMF_ARTIFACTS_BASE_PATH (e.g. s3://bucket/cmf, gs://bucket/cmf) - CMF won't start otherwise"
-    set_args+=( --set cmf.artifacts.enabled=true --set-string "cmf.artifacts.basePath=${CMF_ARTIFACTS_BASE_PATH}" )
+    set_args+=(
+      --set cmf.artifacts.enabled=true
+      --set-string "cmf.artifacts.basePath=${CMF_ARTIFACTS_BASE_PATH}"
+      --set-string "cmf.artifacts.maxUploadSize=${ARTIFACTS_MAX_UPLOAD_SIZE}"
+    )
+    case "$CLOUD" in
+      aws)
+        set_args+=(
+          --set-string 'cmf.artifacts.configuration.fs\.s3a\.access\.key=${AWS_ACCESS_KEY_ID}'
+          --set-string 'cmf.artifacts.configuration.fs\.s3a\.secret\.key=${AWS_SECRET_ACCESS_KEY}'
+          --set "extraEnv[0].name=AWS_ACCESS_KEY_ID"
+          --set "extraEnv[0].valueFrom.secretKeyRef.name=${ARTIFACTS_CREDS_SECRET}"
+          --set "extraEnv[0].valueFrom.secretKeyRef.key=aws-access-key-id"
+          --set "extraEnv[1].name=AWS_SECRET_ACCESS_KEY"
+          --set "extraEnv[1].valueFrom.secretKeyRef.name=${ARTIFACTS_CREDS_SECRET}"
+          --set "extraEnv[1].valueFrom.secretKeyRef.key=aws-secret-access-key"
+        )
+        ;;
+      gcp)
+        set_args+=(
+          --set-string 'cmf.artifacts.configuration.fs\.gs\.auth\.type=SERVICE_ACCOUNT_JSON_KEYFILE'
+          --set-string 'cmf.artifacts.configuration.fs\.gs\.auth\.service\.account\.json\.keyfile=${GCS_KEY_FILE}'
+          --set-string "cmf.artifacts.configuration.fs\.gs\.project\.id=${PROJECT}"
+          --set "extraEnv[0].name=GCS_KEY_FILE"
+          --set-string "extraEnv[0].value=/mnt/gcs/gcs-key.json"
+          --set "mountedVolumes.volumes[0].name=gcs-creds"
+          --set "mountedVolumes.volumes[0].secret.secretName=${ARTIFACTS_CREDS_SECRET}"
+          --set "mountedVolumes.volumeMounts[0].name=gcs-creds"
+          --set-string "mountedVolumes.volumeMounts[0].mountPath=/mnt/gcs"
+          --set "mountedVolumes.volumeMounts[0].readOnly=true"
+        )
+        ;;
+    esac
   fi
   log "CMF feature flags: environmentCatalog=$CMF_ENVIRONMENT_CATALOG_ENABLED mcp=$CMF_MCP_ENABLED (writeTools=$CMF_MCP_WRITE_TOOLS_ENABLED) artifacts=$CMF_ARTIFACTS_ENABLED"
   helm upgrade --install cmf confluentinc/confluent-manager-for-apache-flink \
@@ -357,17 +597,33 @@ cmd_catalog() {
 create_or_update_compute_pool() {
   local env="$1" name="$2" file="$3" type="$4"
   log "Creating compute pool '$name' ($type) in environment '$env'"
-  if confluent flink compute-pool create "$file" --environment "$env" 2>/dev/null; then
-    return 0
-  fi
-  if curl -sf -X PUT -H "Content-Type: application/json" -d "@${file}" \
-      "${CONFLUENT_CMF_URL}/cmf/api/v1/environments/${env}/compute-pools/${name}" >/dev/null; then
-    log "Compute pool '$name' already existed in '$env' - updated it to match $file"
+  # When artifacts are on, inject the Flink-cluster storage access into clusterSpec so
+  # this pool can fetch cmf:// UDF/artifact JARs (no-op passthrough otherwise).
+  local rendered; rendered=$(render_spec_to_tmp .spec.clusterSpec "$file")
+  # Check existence first so the create-vs-update branch (and its message) is accurate.
+  if confluent flink compute-pool describe --environment "$env" "$name" >/dev/null 2>&1; then
+    # Exists -> update via REST (the CLI has no `compute-pool update`).
+    if curl -sf -X PUT -H "Content-Type: application/json" -d "@${rendered}" \
+        "${CONFLUENT_CMF_URL}/cmf/api/v1/environments/${env}/compute-pools/${name}" >/dev/null; then
+      log "Compute pool '$name' already existed in '$env' - updated it to match $file"
+    else
+      warn "compute pool '$name' exists in '$env' but couldn't be updated - it likely has active" \
+        "statements in a non-updatable phase (stop them first: confluent --environment $env flink statement stop <name>)"
+    fi
   else
-    warn "compute pool '$name' already exists in '$env' and couldn't be updated - it likely has" \
-      "active statements in a non-updatable phase (stop/delete them first with" \
-      "'confluent --environment $env flink statement stop <name>')"
+    # Doesn't exist -> create. Retry with backoff: right after environment/catalog setup the
+    # CLI create can transiently fail before CMF is ready to accept it (seen on both clouds).
+    local i cperr
+    cperr=$(mktemp)
+    for i in 1 2 3 4 5 6; do
+      if confluent flink compute-pool create "$rendered" --environment "$env" >"$cperr" 2>&1; then
+        rm -f "$cperr"; cperr=""; break
+      fi
+      sleep 5
+    done
+    [[ -n "$cperr" ]] && { warn "failed to create compute pool '$name' in '$env' after retries: $(tail -1 "$cperr")"; rm -f "$cperr"; }
   fi
+  [[ "$rendered" != "$file" ]] && rm -rf "$(dirname "$rendered")"
 }
 
 cmd_compute_pool() {
@@ -422,12 +678,13 @@ cmd_statement() {
   require_confluent_login
   local env="${1:-prod}" phase
 
-  # By default DDL/streaming run on the SHARED pool and the one-shot data load
-  # runs on the DEDICATED pool (see the insert comment below). Passing a pool
-  # name as the 2nd positional arg overrides *every* step to run on that single
-  # pool, e.g. ./demo.sh --aws --user <name> statement prod shared-pool
+  # By default every step runs on the SHARED pool - it's much faster since there's no
+  # per-job cold start, and the bounded data load takes the grace-period path below
+  # (SHARED pools don't report COMPLETED for bounded jobs). Pass a pool name as the 2nd
+  # positional arg to force a different pool for every step, e.g. `statement prod pool`
+  # to run the data load on the DEDICATED pool, where completion is verifiable.
   local ddl_pool="${2:-$SHARED_COMPUTE_POOL_NAME}"
-  local insert_pool="${2:-$COMPUTE_POOL_NAME}"
+  local insert_pool="${2:-$SHARED_COMPUTE_POOL_NAME}"
 
   log "Creating table 'demo_events' in '$env' (compute pool: $ddl_pool)"
   phase=$(run_pipeline_statement "$env" create-demo-events "$ddl_pool" "$CREATE_EVENTS_SQL_FILE" 60 COMPLETED) || true
@@ -593,9 +850,13 @@ cmd_application() {
   local env="${1:-prod}"
   local file="${2:-$APPLICATION_FILE}"
   [[ -f "$file" ]] || die "application file not found: $file"
+  # When artifacts are on, inject Flink-cluster storage access into .spec so an app
+  # whose job.jarURI is cmf://... can fetch it (no-op passthrough otherwise).
+  local rendered; rendered=$(render_spec_to_tmp .spec "$file")
   log "Creating Flink application from $file in environment '$env'"
-  confluent flink application create "$file" --environment "$env" \
+  confluent flink application create "$rendered" --environment "$env" \
     || warn "application may already exist in '$env'"
+  [[ "$rendered" != "$file" ]] && rm -rf "$(dirname "$rendered")"
 }
 
 cmd_status() {
@@ -626,6 +887,7 @@ cmd_up() {
   cmd_kafka
   cmd_cert_manager
   cmd_flink_operator
+  if [[ "$CMF_ARTIFACTS_ENABLED" == "true" ]]; then cmd_artifacts; fi
   cmd_cmf
   cmd_port_forward
   cmd_c3_forward
@@ -653,8 +915,48 @@ cmd_down_gcp() {
     read -r -p "This will DELETE the GKE cluster '$CLUSTER_NAME' in $ZONE (project $PROJECT). Type 'yes' to continue: " confirm
     [[ "$confirm" == "yes" ]] || { echo "Aborted."; exit 1; }
   fi
+  # Read which SA key we minted (recorded as annotations on the creds secret) BEFORE the
+  # cluster - and its secret - are deleted, so teardown can remove exactly that key.
+  local gcs_key_id="" gcs_sa=""
+  if command -v jq >/dev/null 2>&1 && kubectl -n "$CONFLUENT_NAMESPACE" get secret "$ARTIFACTS_CREDS_SECRET" >/dev/null 2>&1; then
+    local ann
+    ann=$(kubectl -n "$CONFLUENT_NAMESPACE" get secret "$ARTIFACTS_CREDS_SECRET" -o json 2>/dev/null)
+    gcs_key_id=$(echo "$ann" | jq -r '.metadata.annotations["cpf.artifacts/gcs-key-id"] // empty')
+    gcs_sa=$(echo "$ann" | jq -r '.metadata.annotations["cpf.artifacts/gcs-sa"] // empty')
+  fi
   log "Deleting GKE cluster '$CLUSTER_NAME'"
   gcloud container clusters delete "$CLUSTER_NAME" --zone "$ZONE" --project "$PROJECT" --quiet
+  teardown_artifacts_gcp "$gcs_key_id" "$gcs_sa"
+}
+
+# Best-effort teardown of the artifact bucket, minted SA key, and (if we created one)
+# service account. Only touches resources that exist. Args: the key id + SA email we
+# minted (captured from the secret above) - deleting just that key is what makes the
+# reused-SA path clean without deleting someone else's shared SA.
+teardown_artifacts_gcp() {
+  local minted_key_id="${1:-}" minted_sa="${2:-}"
+  local abucket="${ARTIFACTS_BUCKET_PREFIX}-${CFLT_USER}"
+  local sa_email="${abucket}@${PROJECT}.iam.gserviceaccount.com"
+  if gcloud storage buckets describe "gs://${abucket}" --project "$PROJECT" >/dev/null 2>&1; then
+    log "Deleting artifact GCS bucket 'gs://${abucket}'"
+    gcloud storage rm --recursive "gs://${abucket}/**" --project "$PROJECT" 2>/dev/null || true
+    gcloud storage buckets delete "gs://${abucket}" --project "$PROJECT" 2>/dev/null \
+      || warn "could not delete bucket 'gs://${abucket}' - delete manually: gcloud storage rm --recursive gs://${abucket}"
+  fi
+  # Delete exactly the key we minted (covers the reused-SA case, where the SA below
+  # doesn't exist and must be left alone).
+  if [[ -n "$minted_key_id" && -n "$minted_sa" ]]; then
+    log "Deleting minted SA key '${minted_key_id}' on '${minted_sa}'"
+    gcloud iam service-accounts keys delete "$minted_key_id" --iam-account="$minted_sa" --project "$PROJECT" --quiet 2>/dev/null \
+      || warn "could not delete SA key '${minted_key_id}' on '${minted_sa}' - delete manually: gcloud iam service-accounts keys delete ${minted_key_id} --iam-account=${minted_sa}"
+  fi
+  # Delete the script-created SA (exists only when we minted one, not in reuse mode);
+  # this also removes any remaining keys on it.
+  if gcloud iam service-accounts describe "$sa_email" --project "$PROJECT" >/dev/null 2>&1; then
+    log "Deleting artifact service account '$sa_email'"
+    gcloud iam service-accounts delete "$sa_email" --project "$PROJECT" --quiet 2>/dev/null \
+      || warn "could not delete SA '$sa_email'"
+  fi
 }
 
 cmd_down_aws() {
@@ -704,6 +1006,28 @@ cmd_down_aws() {
       log "Leftover EBS volumes deleted"
     fi
   fi
+
+  teardown_artifacts_aws
+}
+
+# Best-effort teardown of the artifact S3 bucket + IAM user (only if they exist); the
+# K8s secret goes away with the cluster. Access keys and the inline policy must be
+# removed before the user can be deleted.
+teardown_artifacts_aws() {
+  local abucket="${ARTIFACTS_BUCKET_PREFIX}-${CFLT_USER}" k
+  if aws s3api head-bucket --bucket "$abucket" --region "$EKS_REGION" >/dev/null 2>&1; then
+    log "Deleting artifact S3 bucket '$abucket'"
+    aws s3 rb "s3://${abucket}" --force --region "$EKS_REGION" >/dev/null 2>&1 \
+      || warn "could not fully empty/delete bucket '$abucket' - delete manually: aws s3 rb s3://${abucket} --force"
+  fi
+  if aws iam get-user --user-name "$abucket" >/dev/null 2>&1; then
+    log "Deleting artifact IAM user '$abucket'"
+    for k in $(aws iam list-access-keys --user-name "$abucket" --query 'AccessKeyMetadata[].AccessKeyId' --output text 2>/dev/null); do
+      aws iam delete-access-key --user-name "$abucket" --access-key-id "$k" 2>/dev/null || true
+    done
+    aws iam delete-user-policy --user-name "$abucket" --policy-name cpf-artifacts-s3 2>/dev/null || true
+    aws iam delete-user --user-name "$abucket" 2>/dev/null || warn "could not delete IAM user '$abucket'"
+  fi
 }
 
 cmd_help() {
@@ -740,6 +1064,9 @@ Individual steps (same order as `up`):
   cert-manager            Install cert-manager (required by the Flink k8s operator)
   flink-operator          Create prod/test namespaces, install the Flink Kubernetes Operator
   cmf                     Install Confluent Manager for Apache Flink (CMF)
+  artifacts               Provision blob storage for CMF 2.4 artifacts (per-user bucket +
+                          scoped static creds in a K8s secret). Only when
+                          CMF_ARTIFACTS_ENABLED=true; `up` runs it before cmf. See config.sh.
   port-forward            Start a background port-forward to cmf-service:8080
   stop-port-forward       Stop all background port-forwards started by this script
   flink-environments      Create the prod/test Flink environments in CMF
@@ -750,9 +1077,10 @@ Individual steps (same order as `up`):
                           sanity-check the environment (default env: prod)
   statement [env] [pool]  Create demo_events/demo_aggregated, seed demo data, and start the
                           continuous windowed-aggregation job (default env: prod). By default
-                          DDL/streaming run on shared-pool and the data load on the DEDICATED
-                          pool; pass a pool name to run every step on that single pool, e.g.
-                          ./demo.sh --aws --user <name> statement prod shared-pool
+                          every step runs on shared-pool (fast - no cold start); pass a pool
+                          name to force a different pool for all steps, e.g.
+                          "statement prod pool" runs the data load on the DEDICATED pool
+                          (slower, but confirms COMPLETED).
   generate-data [env] [count] [pool]  Insert more random rows into demo_events on demand
                           (default env: prod, count: 20, pool: shared-pool -
                           pass e.g. "pool" as 3rd arg to use the DEDICATED
@@ -829,6 +1157,19 @@ fi
 [[ "$CLOUD" == "gcp" ]] && CLUSTER_NAME="${GKE_CLUSTER_NAME_PREFIX}-${CFLT_USER}"
 [[ "$CLOUD" == "aws" ]] && EKS_CLUSTER_NAME="${EKS_CLUSTER_NAME_PREFIX}-${CFLT_USER}"
 
+# Artifact storage bucket is also "<prefix>-<user>"; derive the basePath scheme from
+# the cloud unless the user brought their own CMF_ARTIFACTS_BASE_PATH.
+ARTIFACTS_BUCKET=""
+if [[ -n "$CLOUD" ]]; then
+  ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET_PREFIX}-${CFLT_USER}"
+  if [[ -z "$CMF_ARTIFACTS_BASE_PATH" ]]; then
+    case "$CLOUD" in
+      gcp) CMF_ARTIFACTS_BASE_PATH="gs://${ARTIFACTS_BUCKET}/cmf" ;;
+      aws) CMF_ARTIFACTS_BASE_PATH="s3://${ARTIFACTS_BUCKET}/cmf" ;;
+    esac
+  fi
+fi
+
 case "$sub" in
   up) cmd_up "$@" ;;
   down) cmd_down "$@" ;;
@@ -842,6 +1183,7 @@ case "$sub" in
   cert-manager) cmd_cert_manager "$@" ;;
   flink-operator) cmd_flink_operator "$@" ;;
   cmf) cmd_cmf "$@" ;;
+  artifacts) cmd_artifacts "$@" ;;
   port-forward) cmd_port_forward "$@" ;;
   stop-port-forward) cmd_stop_port_forward "$@" ;;
   flink-environments) cmd_flink_environments "$@" ;;
