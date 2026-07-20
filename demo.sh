@@ -427,28 +427,26 @@ cmd_artifacts_gcp() {
 render_flink_storage() {
   local spec_path="$1"
   if [[ "$CMF_ARTIFACTS_ENABLED" != "true" ]]; then cat; return 0; fi
-  local fsconf pluginjar
+  local scheme override
   case "$CLOUD" in
-    aws)
-      pluginjar="$ARTIFACTS_S3_PLUGIN_JAR"
-      fsconf='{"s3.access-key":"${AWS_ACCESS_KEY_ID}","s3.secret-key":"${AWS_SECRET_ACCESS_KEY}"}'
-      ;;
-    gcp)
-      pluginjar="$ARTIFACTS_GCS_PLUGIN_JAR"
-      fsconf='{"gs.filesystem.credential.file":"/mnt/gcs/gcs-key.json"}'
-      ;;
+    aws) scheme=s3; override="$ARTIFACTS_S3_PLUGIN_JAR" ;;
+    gcp) scheme=gs; override="$ARTIFACTS_GCS_PLUGIN_JAR" ;;
   esac
-  # Build the env / volumes the Flink main container needs. For AWS the creds come in as
-  # env vars referenced by ${..} in flinkConfiguration; for GCP the key is mounted as a file.
+  # Credentials reach the built-in filesystem plugin via env vars (no flinkConfiguration
+  # needed): AWS via the SDK's AWS_ACCESS_KEY_ID/SECRET chain; GCS via the recommended
+  # GOOGLE_APPLICATION_CREDENTIALS pointing at the mounted key. The plugin jar name tracks
+  # the spec's OWN image tag (flink-<scheme>-fs-hadoop-<tag>.jar), since a FlinkApplication
+  # can use a different image than the compute pools; override with ARTIFACTS_*_PLUGIN_JAR.
   jq \
     --arg path "$spec_path" \
-    --arg plugin "$pluginjar" \
-    --argjson fsconf "$fsconf" \
+    --arg scheme "$scheme" \
+    --arg override "$override" \
     --arg secret "$ARTIFACTS_CREDS_SECRET" \
     --arg cloud "$CLOUD" '
     ($path | ltrimstr(".") | split(".")) as $p
     | getpath($p) as $spec
-    | (($spec.flinkConfiguration // {}) + $fsconf) as $newconf
+    | (if $override != "" then $override
+       else "flink-\($scheme)-fs-hadoop-\(($spec.image // "") | split(":") | last).jar" end) as $plugin
     | (if $cloud == "aws" then
          { env: [
              {name:"AWS_ACCESS_KEY_ID", valueFrom:{secretKeyRef:{name:$secret, key:"aws-access-key-id"}}},
@@ -456,7 +454,10 @@ render_flink_storage() {
              {name:"ENABLE_BUILT_IN_PLUGINS", value:$plugin}
            ] }
        else
-         { env: [ {name:"ENABLE_BUILT_IN_PLUGINS", value:$plugin} ],
+         { env: [
+             {name:"GOOGLE_APPLICATION_CREDENTIALS", value:"/mnt/gcs/gcs-key.json"},
+             {name:"ENABLE_BUILT_IN_PLUGINS", value:$plugin}
+           ],
            volumeMounts: [ {name:"gcs-creds", mountPath:"/mnt/gcs", readOnly:true} ] }
        end) as $container
     | (if $cloud == "gcp" then
@@ -465,7 +466,7 @@ render_flink_storage() {
        else
          { spec: { containers: [ ({name:"flink-main-container"} + $container) ] } }
        end) as $podTemplate
-    | setpath($p; $spec + {flinkConfiguration: $newconf, podTemplate: $podTemplate})
+    | setpath($p; $spec + {podTemplate: $podTemplate})
   '
 }
 
@@ -623,7 +624,11 @@ create_or_update_compute_pool() {
     done
     [[ -n "$cperr" ]] && { warn "failed to create compute pool '$name' in '$env' after retries: $(tail -1 "$cperr")"; rm -f "$cperr"; }
   fi
-  [[ "$rendered" != "$file" ]] && rm -rf "$(dirname "$rendered")"
+  # Not just a style choice: this being a bare `&&` as the function's last statement
+  # means a false test (the common case, rendered==file) makes the function return 1,
+  # which - since the call site uses it as a plain statement - kills the whole script
+  # under `set -e`. Must stay an if/fi.
+  if [[ "$rendered" != "$file" ]]; then rm -rf "$(dirname "$rendered")"; fi
 }
 
 cmd_compute_pool() {
@@ -856,7 +861,7 @@ cmd_application() {
   log "Creating Flink application from $file in environment '$env'"
   confluent flink application create "$rendered" --environment "$env" \
     || warn "application may already exist in '$env'"
-  [[ "$rendered" != "$file" ]] && rm -rf "$(dirname "$rendered")"
+  if [[ "$rendered" != "$file" ]]; then rm -rf "$(dirname "$rendered")"; fi
 }
 
 cmd_status() {

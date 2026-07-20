@@ -71,11 +71,12 @@
 # objectAdmin on the bucket and mints a JSON key for it rather than creating a new SA.
 : "${ARTIFACTS_GCS_SA:=}"                        # existing SA email, e.g. me@<project>.iam.gserviceaccount.com
 # Flink built-in filesystem plugin enabled on the Flink cluster so it can fetch cmf://
-# artifacts itself (CMF does NOT pass its creds to the cluster). The jar name tracks the
-# Flink image tag (cp-flink-sql:1.19-cp8 -> ...-1.19-cp8.jar); verified via
-# `ls /opt/flink/opt` in the image. Bump alongside the image.
-: "${ARTIFACTS_S3_PLUGIN_JAR:=flink-s3-fs-hadoop-1.19-cp8.jar}"
-: "${ARTIFACTS_GCS_PLUGIN_JAR:=flink-gs-fs-hadoop-1.19-cp8.jar}"
+# artifacts itself (CMF does NOT pass its creds to the cluster). Leave EMPTY to derive the
+# jar name from each spec's own image tag (flink-<scheme>-fs-hadoop-<tag>.jar) - important
+# because a FlinkApplication may use a different image than the compute pools. Set only to
+# force a specific jar (verify names with `ls /opt/flink/opt` in the image).
+: "${ARTIFACTS_S3_PLUGIN_JAR:=}"
+: "${ARTIFACTS_GCS_PLUGIN_JAR:=}"
 
 # --- Container image versions for cp/cp.yaml ---
 # demo.sh renders these into the manifest before applying it (see cmd_kafka),

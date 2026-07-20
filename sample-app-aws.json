@@ -1,0 +1,67 @@
+{
+  "apiVersion": "cmf.confluent.io/v1",
+  "kind": "FlinkApplication",
+  "metadata": {
+    "name": "sample-app-aws"
+  },
+  "spec": {
+    "flinkConfiguration": {
+      "taskmanager.numberOfTaskSlots": "1"
+    },
+    "flinkVersion": "v1_19",
+    "image": "confluentinc/cp-flink:1.19.1-cp2",
+    "job": {
+      "jarURI": "cmf://test/your-jar-name.jar?version=1",
+      "parallelism": 1,
+      "state": "running",
+      "upgradeMode": "stateless",
+      "entryClass": "your.main.ClassName"
+    },
+    "jobManager": {
+      "resource": {
+        "cpu": 1,
+        "memory": "1024m"
+      }
+    },
+    "serviceAccount": "flink",
+    "taskManager": {
+      "resource": {
+        "cpu": 1,
+        "memory": "1024m"
+      }
+    },
+    "podTemplate": {
+      "spec": {
+        "containers": [
+          {
+            "name": "flink-main-container",
+            "env": [
+              {
+                "name": "AWS_ACCESS_KEY_ID",
+                "valueFrom": {
+                  "secretKeyRef": {
+                    "name": "cmf-artifacts-creds",
+                    "key": "aws-access-key-id"
+                  }
+                }
+              },
+              {
+                "name": "AWS_SECRET_ACCESS_KEY",
+                "valueFrom": {
+                  "secretKeyRef": {
+                    "name": "cmf-artifacts-creds",
+                    "key": "aws-secret-access-key"
+                  }
+                }
+              },
+              {
+                "name": "ENABLE_BUILT_IN_PLUGINS",
+                "value": "flink-s3-fs-hadoop-1.19.1-cp2.jar"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

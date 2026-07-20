@@ -143,10 +143,13 @@ key (recorded on the secret) without touching the shared SA itself.
 Tunables (see `config.sh`): `ARTIFACTS_BUCKET_PREFIX` (default `cpf-artifacts`),
 `ARTIFACTS_GCS_LOCATION` (derived from `ZONE`), `ARTIFACTS_MAX_UPLOAD_SIZE`
 (`250MB`), `ARTIFACTS_CREDS_SECRET`, and `ARTIFACTS_S3_PLUGIN_JAR` /
-`ARTIFACTS_GCS_PLUGIN_JAR` (the Flink built-in filesystem plugin — must match the
-Flink image; verify with `ls /opt/flink/opt`). Override `CMF_ARTIFACTS_BASE_PATH`
-to bring your own path. Minting IAM users / SA keys may be blocked by org policy —
-the step fails with a clear message if so.
+`ARTIFACTS_GCS_PLUGIN_JAR` (the Flink built-in filesystem plugin enabled on each
+pool/application). Left **empty by default**, which auto-derives the jar name
+from that spec's own image tag (`flink-<scheme>-fs-hadoop-<tag>.jar`) — set one
+explicitly only to override, e.g. if a `FlinkApplication` uses a different image
+than the compute pools (verify jar names with `ls /opt/flink/opt` in the image).
+Override `CMF_ARTIFACTS_BASE_PATH` to bring your own path. Minting IAM users / SA
+keys may be blocked by org policy — the step fails with a clear message if so.
 
 ## Command reference
 
