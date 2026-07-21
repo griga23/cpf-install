@@ -178,7 +178,7 @@ and `--user <name>` (see Quick start); both are omitted below for brevity.
 | `verify [env]` | Sanity-checks the environment via a disposable table (default `prod`) |
 | `statement [env] [pool]` | Runs the full stream-processing demo pipeline (default `prod`). By default every step runs on `shared-pool` (fast — no cold start); pass a pool name to force a different pool for all steps (e.g. `statement prod pool` runs the data load on the DEDICATED `pool`, which confirms COMPLETED but is slower) |
 | `generate-data [env] [count] [pool]` | Inserts more random rows into `demo_events` on demand (default `prod`, `20` rows, `shared-pool`) |
-| `application [env] [file]` | Deploys a raw `FlinkApplication` (default `prod`, `cpf_basic_app.json`) |
+| `application [env] [file]` | Deploys a raw `FlinkApplication` (default `prod`, `app/cpf_basic_app.json`) |
 | `c3-forward` | Background port-forward for Control Center → `localhost:9021` |
 | `cmf-ui` | Ensures the CMF port-forward and opens the CMF 2.4 web UI (root of `localhost:8080`, same port as the REST API) |
 | `status` | Shows pod health, Flink environments, and port-forward status |
@@ -282,7 +282,7 @@ confluent --environment prod flink statement delete flink-statement --force
 
 ```sh
 ./demo.sh --gcp application prod
-./demo.sh --gcp application test cpf3.json    # or point at a different resource file
+./demo.sh --gcp application test app/cpf_basic_app.json    # or point at a different resource file
 ```
 
 **Resize a compute pool:** edit `flink/compute-pool.json` or

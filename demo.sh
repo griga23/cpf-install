@@ -1090,7 +1090,7 @@ Individual steps (same order as `up`):
                           (default env: prod, count: 20, pool: shared-pool -
                           pass e.g. "pool" as 3rd arg to use the DEDICATED
                           pool instead, which is slower but confirms COMPLETED)
-  application [env] [file] Deploy a simple FlinkApplication (default env: prod, default file: cpf_basic_app.json)
+  application [env] [file] Deploy a simple FlinkApplication (default env: prod, default file: app/cpf_basic_app.json)
 
 Utilities:
   c3-forward              Start a background port-forward to Control Center on :9021

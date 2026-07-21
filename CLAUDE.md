@@ -58,8 +58,12 @@ any other config change.
   by `cmd_statement` (create `demo_events` → create `demo_aggregated` → seed
   data → continuous windowed aggregation). CMF accepts one statement per
   submission, so these can never be merged into one script.
-- `cpf_basic_app.json`, `cpf3.json` — standalone `FlinkApplication` CRDs
-  deployed via `cmd_application` (unrelated to the SQL pipeline).
+- `app/*.json` — standalone `FlinkApplication` CRDs deployed via
+  `cmd_application` (unrelated to the SQL pipeline): `cpf_basic_app.json`
+  (default) runs as-is; `sample-app-gcp.json`/`sample-app-aws.json` are
+  reference templates for a `cmf://`-artifact-based app on each cloud
+  (placeholder `jarURI`/`entryClass` — fill in before use), matching exactly
+  what `render_flink_storage()` generates for that cloud.
 
 ## Architecture notes worth knowing before editing `demo.sh`
 

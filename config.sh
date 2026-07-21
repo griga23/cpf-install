@@ -109,6 +109,6 @@ export CONFLUENT_CMF_URL
 : "${CREATE_AGGREGATED_SQL_FILE:=sql/create_demo_aggregated.sql}"
 : "${INSERT_DEMO_DATA_SQL_FILE:=sql/insert_demo_data.sql}"
 : "${STREAMING_SQL_FILE:=sql/streaming_aggregation.sql}"
-: "${APPLICATION_FILE:=cpf_basic_app.json}"
+: "${APPLICATION_FILE:=app/cpf_basic_app.json}"
 : "${GENERATE_DATA_ROW_COUNT:=20}"         # default rows for ./demo.sh generate-data
 : "${GENERATE_DATA_MAX_OFFSET_SECONDS:=90}" # spread new rows over the last N seconds
