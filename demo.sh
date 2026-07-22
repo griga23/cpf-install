@@ -33,15 +33,21 @@ require_aws_identity() {
     || die "aws CLI has no valid credentials (session expired, e.g. an SSO token, or AWS_PROFILE/credentials are wrong) - run 'aws sts get-caller-identity' to diagnose, re-authenticate (e.g. 'granted sso login ...' or re-export AWS_PROFILE), and retry"
 }
 
-# Catches a confusing failure mode: `confluent context list` can show a
-# "current" context that's actually stale/corrupted, in which case every
-# `confluent flink ...` call below fails with "not logged in" even though a
-# context exists. This is unrelated to which cloud/CMF instance is targeted -
-# the flink subcommands only talk to CMF via $CONFLUENT_CMF_URL/--url - the
-# CLI just independently requires some valid session before running anything.
-require_confluent_login() {
+# Catches a confusing failure mode: `confluent flink ...` REFUSES to run while a
+# Confluent Cloud or Confluent Platform context is selected, failing with
+# "you must log out of Confluent Cloud to use this command". `confluent logout` is
+# NOT enough - it drops the credential but leaves the context selected as
+# current_context, so the refusal persists. These subcommands only ever talk to CMF
+# via $CONFLUENT_CMF_URL/--url, so no login is needed (or wanted); deleting all
+# contexts clears current_context and unblocks them. (If no context is selected the
+# same probe can still fail because CMF is unreachable - hence the port-forward hint.)
+require_cmf_access() {
   confluent flink environment list >/dev/null 2>&1 \
-    || die "confluent CLI is not logged in (or its session is stale/corrupted) - run 'confluent context list', clear any broken contexts with 'confluent context delete <name>', then 'confluent login --save' and retry. Any login works (Confluent Cloud or Platform) since these commands talk to CMF via \$CONFLUENT_CMF_URL regardless of the login's own target"
+    || die "confluent CLI can't reach CMF. Most likely a Confluent Cloud/Platform context is still selected ('confluent logout' does NOT clear it) - log out and delete every context, then retry:
+    confluent logout
+    confluent context list                 # note each context Name
+    confluent context delete <name>         # repeat for every context listed
+If no context is selected, make sure the CMF port-forward is up and \$CONFLUENT_CMF_URL ($CONFLUENT_CMF_URL) is reachable."
 }
 
 ensure_namespace() {
@@ -84,36 +90,53 @@ is_port_listening() {
   [[ $? -ne 7 ]] # curl exit 7 = connection refused, i.e. nothing listening
 }
 
+# Stronger than is_port_listening: returns success only when the port completes an
+# HTTP round trip (curl exit 0). A kubectl port-forward whose target pod has
+# restarted often keeps the local socket open but no longer forwards - that answers
+# is_port_listening (not "connection refused") yet fails here, which is exactly the
+# state that left cmf-ui/c3-ui opening a browser against a dead port.
+is_port_serving() {
+  curl -s -o /dev/null --max-time 2 "http://localhost:$1/" 2>/dev/null
+}
+
+# Ensures a WORKING port-forward on $port: returns fast if the port already serves,
+# otherwise reaps any stale/broken forward we started and (re)starts kubectl
+# port-forward, waiting until it actually serves before returning. Verifying
+# reachability - not just PID liveness - is what stops the callers from opening a
+# browser against a forward kubectl kept "running" but stopped forwarding.
+# Args: <pid-file> <local-port> <kubectl-target> <port-mapping> <logfile> <label>
+ensure_port_forward() {
+  local pid_file="$1" port="$2" target="$3" mapping="$4" logfile="$5" label="$6"
+  if is_port_serving "$port"; then
+    return 0
+  fi
+  # Reap a tracked forward that is dead, or alive-but-not-forwarding (broken).
+  if [[ -f "$pid_file" ]]; then
+    kill "$(cat "$pid_file")" 2>/dev/null || true
+    rm -f "$pid_file"
+  fi
+  log "Starting background port-forward: ${target} -> localhost:${port} (${label})"
+  kubectl -n "$CONFLUENT_NAMESPACE" port-forward "$target" "$mapping" >"$logfile" 2>&1 &
+  echo $! > "$pid_file"
+  # Poll until it actually answers (pod/image cold start can take several seconds).
+  local waited=0
+  while (( waited < 30 )); do
+    kill -0 "$(cat "$pid_file")" 2>/dev/null \
+      || { rm -f "$pid_file"; die "${label} port-forward exited immediately, see ${logfile}"; }
+    is_port_serving "$port" && return 0
+    sleep 1; waited=$((waited + 1))
+  done
+  die "${label} port-forward did not become reachable on localhost:${port} within 30s, see ${logfile}"
+}
+
 ensure_cmf_port_forward() {
-  if is_port_forward_alive "$PORT_FORWARD_PID_FILE"; then
-    return 0
-  fi
-  if is_port_listening "$CMF_LOCAL_PORT"; then
-    warn "something is already listening on localhost:${CMF_LOCAL_PORT} (not started by this script) - reusing it"
-    return 0
-  fi
-  log "Starting background port-forward: cmf-service -> localhost:${CMF_LOCAL_PORT}"
-  kubectl -n "$CONFLUENT_NAMESPACE" port-forward service/cmf-service "${CMF_LOCAL_PORT}:80" \
-    >/tmp/demo-cmf-port-forward.log 2>&1 &
-  echo $! > "$PORT_FORWARD_PID_FILE"
-  sleep 3
-  is_port_forward_alive "$PORT_FORWARD_PID_FILE" || die "cmf port-forward failed to start, see /tmp/demo-cmf-port-forward.log"
+  ensure_port_forward "$PORT_FORWARD_PID_FILE" "$CMF_LOCAL_PORT" \
+    service/cmf-service "${CMF_LOCAL_PORT}:80" /tmp/demo-cmf-port-forward.log "CMF"
 }
 
 ensure_c3_port_forward() {
-  if is_port_forward_alive "$C3_PORT_FORWARD_PID_FILE"; then
-    return 0
-  fi
-  if is_port_listening "$C3_LOCAL_PORT"; then
-    warn "something is already listening on localhost:${C3_LOCAL_PORT} (not started by this script) - reusing it"
-    return 0
-  fi
-  log "Starting background port-forward: controlcenter-ng-0 -> localhost:${C3_LOCAL_PORT}"
-  kubectl -n "$CONFLUENT_NAMESPACE" port-forward controlcenter-ng-0 "${C3_LOCAL_PORT}:9021" \
-    >/tmp/demo-c3-port-forward.log 2>&1 &
-  echo $! > "$C3_PORT_FORWARD_PID_FILE"
-  sleep 3
-  is_port_forward_alive "$C3_PORT_FORWARD_PID_FILE" || die "control center port-forward failed to start, see /tmp/demo-c3-port-forward.log"
+  ensure_port_forward "$C3_PORT_FORWARD_PID_FILE" "$C3_LOCAL_PORT" \
+    controlcenter-ng-0 "${C3_LOCAL_PORT}:9021" /tmp/demo-c3-port-forward.log "Control Center"
 }
 
 # ---------------------------------------------------------------------------
@@ -142,6 +165,155 @@ cmd_cluster_gcp() {
   fi
   gcloud container clusters get-credentials "$CLUSTER_NAME" --zone "$ZONE" --project "$PROJECT"
   kubectl cluster-info
+}
+
+# Preflight quota check: eksctl's default VPC uses natMode Single -> it creates exactly ONE
+# NAT gateway, in an AZ it picks itself. The "NAT gateways per Availability Zone"
+# quota (Service Quotas: service `vpc`, code L-FE5A380F, default 5) counts every
+# NAT gateway in that AZ across ALL VPCs in the account/region, so a brand-new
+# eksctl VPC can still fail if the AZ it lands in is already full (this is exactly
+# why EKS_REGION defaults away from the shared account's saturated eu-west-1).
+# We flag it as exceeded only when EVERY AZ in the region is at quota (a likely
+# failure) and warn (without flagging) when only some AZs are saturated, since
+# eksctl might still pick a full one. Exceeded checks increment the caller's
+# `quota_exceeded` counter so cmd_check_quotas_aws can prompt once at the end.
+preflight_nat_quota_aws() {
+  local quota_code="L-FE5A380F" limit
+  # Per-AZ NAT gateway quota. Fall back to the AWS default of 5 if the API is
+  # unavailable or the caller lacks servicequotas:GetServiceQuota.
+  limit=$(aws service-quotas get-service-quota \
+            --region "$EKS_REGION" --service-code vpc --quota-code "$quota_code" \
+            --query 'Quota.Value' --output text 2>/dev/null)
+  if [[ -z "$limit" || "$limit" == "None" ]]; then
+    warn "could not read the NAT-gateway-per-AZ quota (servicequotas:GetServiceQuota) - assuming AWS default of 5"
+    limit=5
+  fi
+  limit=${limit%.*}   # service-quotas returns a float like "5.0"
+
+  # Subnets of every NAT gateway already consuming a slot (pending + available).
+  local nat_subnets az_counts azs_available azs_with_room=0 total_azs=0 saturated=""
+  nat_subnets=$(aws ec2 describe-nat-gateways --region "$EKS_REGION" \
+                  --filter 'Name=state,Values=pending,available' \
+                  --query 'NatGateways[].SubnetId' --output text 2>/dev/null)
+  if [[ -z "$nat_subnets" ]]; then
+    log "NAT-gateway quota check: no existing NAT gateways in $EKS_REGION (quota ${limit}/AZ) - OK"
+    return 0
+  fi
+  # NAT gateways don't report their AZ directly, so resolve subnet -> AZ and tally.
+  az_counts=$(aws ec2 describe-subnets --region "$EKS_REGION" --subnet-ids $nat_subnets \
+                --query 'Subnets[].AvailabilityZone' --output text \
+                | tr '\t' '\n' | sort | uniq -c)
+
+  local az used
+  azs_available=$(aws ec2 describe-availability-zones --region "$EKS_REGION" \
+                    --query 'AvailabilityZones[?State==`available`].ZoneName' \
+                    --output text | tr '\t' '\n')
+  for az in $azs_available; do
+    total_azs=$((total_azs + 1))
+    used=$(printf '%s\n' "$az_counts" | awk -v z="$az" '$2==z {print $1}')
+    used=${used:-0}
+    if (( used < limit )); then
+      azs_with_room=$((azs_with_room + 1))
+    else
+      saturated="${saturated:+$saturated }$az"
+    fi
+  done
+
+  if (( azs_with_room == 0 )); then
+    warn "NAT-gateway quota EXCEEDED: every AZ in $EKS_REGION is at the quota (${limit}/AZ) - eksctl likely cannot create its NAT gateway. Request a quota increase (Service Quotas: vpc / $quota_code), release an existing NAT gateway, or set EKS_REGION to another region."
+    quota_exceeded=$(( ${quota_exceeded:-0} + 1 ))
+    quota_exceeded_list="${quota_exceeded_list:+$quota_exceeded_list, }NAT gateways per AZ"
+    return 0
+  fi
+  if [[ -n "$saturated" ]]; then
+    warn "NAT-gateway preflight: $azs_with_room/$total_azs AZs have headroom (quota ${limit}/AZ); saturated: $saturated. eksctl picks its own AZ (natMode Single) and could still land in a full one - if create fails, request a quota increase or pin an AZ with room."
+  else
+    log "NAT-gateway preflight: all $total_azs AZs in $EKS_REGION have headroom (quota ${limit}/AZ) - OK"
+  fi
+}
+
+# Generic per-region quota preflight checks for the region-wide resources every eksctl
+# cluster adds exactly one of. Unlike the NAT-gateway quota (per-AZ), these are a
+# single region-wide count, so the check is just: (in use + need) <= quota. When it
+# wouldn't fit we warn and increment the caller's `quota_exceeded` counter (rather
+# than aborting) so cmd_check_quotas_aws can prompt once at the end. Falls back to the
+# AWS default of 5 if servicequotas:GetServiceQuota is unavailable/denied.
+# Args: <label> <service-code> <quota-code> <in-use count> <need> <fix-hint>
+preflight_region_quota_aws() {
+  local label="$1" service="$2" quota_code="$3" used="$4" need="$5" hint="$6" limit
+  used=${used:-0}
+  limit=$(aws service-quotas get-service-quota \
+            --region "$EKS_REGION" --service-code "$service" --quota-code "$quota_code" \
+            --query 'Quota.Value' --output text 2>/dev/null)
+  if [[ -z "$limit" || "$limit" == "None" ]]; then
+    warn "could not read the '$label' quota ($service/$quota_code) - assuming AWS default of 5"
+    limit=5
+  fi
+  limit=${limit%.*}   # service-quotas returns a float like "5.0"
+  if (( used + need > limit )); then
+    warn "'$label' quota EXCEEDED in $EKS_REGION: $used/$limit already in use and eksctl needs $need more. $hint"
+    quota_exceeded=$(( ${quota_exceeded:-0} + 1 ))
+    quota_exceeded_list="${quota_exceeded_list:+$quota_exceeded_list, }$label"
+    return 0
+  fi
+  log "$label quota check: $used/$limit in use in $EKS_REGION, eksctl needs $need more - OK"
+}
+
+# Cloud-agnostic quota preflight, run as the FIRST step of `up` so we fail fast
+# (before creating any cloud resources) when a shared account/project doesn't have
+# the headroom for another per-user cluster. AWS is implemented; GCP is a no-op stub.
+cmd_check_quotas() {
+  case "$CLOUD" in
+    gcp) cmd_check_quotas_gcp ;;
+    aws) cmd_check_quotas_aws ;;
+  esac
+}
+
+# TODO(gcp): implement GCP quota preflight before `gcloud container clusters create`.
+# The plausible ones for the default 3x e2-standard-4 GKE cluster (+ artifacts) are:
+#   - CPUS (region): +12 vCPU per cluster (3x e2-standard-4)
+#   - IN_USE_ADDRESSES (region): +3 ephemeral external IPs (one per node)
+#   - SSD_TOTAL_GB / DISK_TOTAL_GB (region): node boot disks + PVCs
+#   - IAM service accounts per project: +1 (already mitigated via ARTIFACTS_GCS_SA)
+# Query with: gcloud compute regions describe "${ZONE%-*}" --project "$PROJECT"
+#   --format="value(quotas)"  (or the Cloud Quotas API for SA/IAM limits).
+cmd_check_quotas_gcp() {
+  warn "GCP quota preflight not implemented yet - skipping (see TODO in cmd_check_quotas_gcp)"
+}
+
+# Every `eksctl create cluster` (default config) builds a brand-new VPC with its
+# own internet gateway plus one NAT gateway that consumes one Elastic IP - so each
+# concurrent demo user needs one free slot in each of these region-wide quotas
+# (all default to 5). Each sub-check WARNS (rather than aborting) when a quota is
+# exceeded and bumps `quota_exceeded`; if any were, we ask the user whether to
+# proceed regardless (default "n"), since creating the cluster may fail and leave a
+# half-built CloudFormation stack to clean up.
+cmd_check_quotas_aws() {
+  require_cmds aws
+  local vpc_used igw_used eip_used quota_exceeded=0 quota_exceeded_list="" reply
+  vpc_used=$(aws ec2 describe-vpcs --region "$EKS_REGION" \
+               --query 'length(Vpcs)' --output text 2>/dev/null)
+  igw_used=$(aws ec2 describe-internet-gateways --region "$EKS_REGION" \
+               --query 'length(InternetGateways)' --output text 2>/dev/null)
+  eip_used=$(aws ec2 describe-addresses --region "$EKS_REGION" \
+               --query 'length(Addresses)' --output text 2>/dev/null)
+
+  preflight_region_quota_aws "VPCs per region" vpc L-F678F1CE "$vpc_used" 1 \
+    "Request a quota increase (Service Quotas: vpc / L-F678F1CE), delete an unused VPC, or set EKS_REGION to another region."
+  preflight_region_quota_aws "Internet gateways per region" vpc L-A4707A72 "$igw_used" 1 \
+    "Request a quota increase (Service Quotas: vpc / L-A4707A72), delete an unused internet gateway, or set EKS_REGION to another region."
+  preflight_region_quota_aws "Elastic IPs per region" ec2 L-0263D0A3 "$eip_used" 1 \
+    "Request a quota increase (Service Quotas: ec2 / L-0263D0A3), release an unused Elastic IP, or set EKS_REGION to another region."
+  preflight_nat_quota_aws
+
+  if (( quota_exceeded > 0 )); then
+    warn "$quota_exceeded AWS quota check(s) exceeded: ${quota_exceeded_list}. Cluster creation may fail and leave a half-built CloudFormation stack to clean up."
+    read -r -p "Proceed anyway? [y/N] " reply || reply=""
+    case "$reply" in
+      [yY]|[yY][eE][sS]) warn "proceeding despite quota warnings (user confirmed)" ;;
+      *) echo "Aborted."; exit 1 ;;
+    esac
+  fi
 }
 
 cmd_cluster_aws() {
@@ -257,6 +429,15 @@ cmd_cmf_ui() {
   ensure_cmf_port_forward
   local url="${CONFLUENT_CMF_URL}/"
   log "CMF web UI: ${url}  (REST API: ${CONFLUENT_CMF_URL}/cmf/api/v1)"
+  command -v open >/dev/null 2>&1 && open "$url" >/dev/null 2>&1 || true
+}
+
+# C3 analog of cmd_cmf_ui: ensures the Control Center port-forward and opens the
+# C3 web UI in a browser where possible.
+cmd_c3_ui() {
+  ensure_c3_port_forward
+  local url="http://localhost:${C3_LOCAL_PORT}/home"
+  log "Control Center web UI: ${url}"
   command -v open >/dev/null 2>&1 && open "$url" >/dev/null 2>&1 || true
 }
 
@@ -545,7 +726,7 @@ cmd_cmf() {
   wait_pods_ready "$CONFLUENT_NAMESPACE" 180s
 }
 
-cmd_port_forward() {
+cmd_cmf_forward() {
   ensure_cmf_port_forward
   if [[ -f "$PORT_FORWARD_PID_FILE" ]]; then
     log "CMF reachable at ${CONFLUENT_CMF_URL} (pid $(cat "$PORT_FORWARD_PID_FILE"))"
@@ -567,7 +748,7 @@ cmd_stop_port_forward() {
 cmd_flink_environments() {
   require_cmds confluent
   ensure_cmf_port_forward
-  require_confluent_login
+  require_cmf_access
   for env in $FLINK_ENVIRONMENTS; do
     log "Creating Flink environment '$env'"
     confluent flink environment create "$env" --kubernetes-namespace "$env" \
@@ -579,7 +760,7 @@ cmd_flink_environments() {
 cmd_catalog() {
   require_cmds confluent
   ensure_cmf_port_forward
-  require_confluent_login
+  require_cmf_access
   log "Creating Kafka catalog '$CATALOG_NAME' from $CATALOG_FILE"
   confluent flink catalog create "$CATALOG_FILE" || warn "catalog may already exist"
   log "Creating database '$DATABASE_NAME' from $DATABASE_FILE (DDL permissions for: $FLINK_ENVIRONMENTS)"
@@ -634,10 +815,17 @@ create_or_update_compute_pool() {
 cmd_compute_pool() {
   require_cmds confluent
   ensure_cmf_port_forward
-  require_confluent_login
+  require_cmf_access
+  local phase
   for env in $FLINK_ENVIRONMENTS; do
     create_or_update_compute_pool "$env" "$COMPUTE_POOL_NAME" "$COMPUTE_POOL_FILE" DEDICATED
     create_or_update_compute_pool "$env" "$SHARED_COMPUTE_POOL_NAME" "$SHARED_COMPUTE_POOL_FILE" SHARED
+    # The SHARED pool backs all DDL/verify/streaming statements, and CMF refuses to
+    # deploy to it until it's RUNNING. Wait here so cmd_verify/cmd_demo_pipeline right
+    # after `up` don't race its (cold-start) provisioning.
+    log "Waiting for compute pool '$SHARED_COMPUTE_POOL_NAME' in '$env' to reach RUNNING"
+    phase=$(wait_for_compute_pool_phase "$env" "$SHARED_COMPUTE_POOL_NAME" 300 RUNNING) || true
+    [[ "$phase" == "RUNNING" ]] || warn "compute pool '$SHARED_COMPUTE_POOL_NAME' in '$env' not RUNNING yet (phase=$phase) - statements may fail until it is; check './demo.sh status' and retry"
   done
 }
 
@@ -652,6 +840,26 @@ wait_for_statement_phase() {
   local waited=0 phase want
   while true; do
     phase=$(confluent --environment "$env" flink statement describe "$name" -o json 2>/dev/null | jq -r '.status.phase // "UNKNOWN"') || true
+    for want in "$@"; do
+      [[ "$phase" == "$want" ]] && { echo "$phase"; return 0; }
+    done
+    [[ "$phase" == "FAILED" ]] && { echo "$phase"; return 1; }
+    (( waited >= timeout )) && { echo "$phase"; return 1; }
+    sleep 3
+    waited=$((waited + 3))
+  done
+}
+
+# Polls a compute pool's phase until it matches one of the given "ok" phases
+# (success), FAILED (failure), or the timeout elapses. Prints the final phase seen.
+# Mirrors wait_for_statement_phase: CMF rejects statement submissions to a SHARED
+# pool that isn't RUNNING yet (PENDING -> PROVISIONING -> RUNNING on a cold start),
+# so callers wait here before running DDL/verify/the streaming job.
+wait_for_compute_pool_phase() {
+  local env="$1" name="$2" timeout="$3"; shift 3
+  local waited=0 phase want
+  while true; do
+    phase=$(confluent flink compute-pool describe --environment "$env" "$name" -o json 2>/dev/null | jq -r '.status.phase // "UNKNOWN"') || true
     for want in "$@"; do
       [[ "$phase" == "$want" ]] && { echo "$phase"; return 0; }
     done
@@ -677,10 +885,10 @@ run_pipeline_statement() {
   wait_for_statement_phase "$env" "$name" "$timeout" "$@"
 }
 
-cmd_statement() {
+cmd_demo_pipeline() {
   require_cmds confluent jq
   ensure_cmf_port_forward
-  require_confluent_login
+  require_cmf_access
   local env="${1:-prod}" phase
 
   # By default every step runs on the SHARED pool - it's much faster since there's no
@@ -723,6 +931,7 @@ cmd_statement() {
     sleep 10
     delete_statement_quiet "$env" insert-demo-data
     warn "insert ran on SHARED pool '$insert_pool' - completion isn't verifiable, but should already be done"
+    log "Observe statements in the CMF or C3 UI: Flink Environment > $env > Statements"
   else
     phase=$(wait_for_statement_phase "$env" insert-demo-data 150 COMPLETED) || true
     [[ "$phase" == "COMPLETED" ]] || die "inserting demo data failed (phase=$phase) - check: confluent --environment $env flink statement describe insert-demo-data"
@@ -753,7 +962,7 @@ cmd_statement() {
 cmd_generate_data() {
   require_cmds confluent jq
   ensure_cmf_port_forward
-  require_confluent_login
+  require_cmf_access
   local env="${1:-prod}" count="${2:-$GENERATE_DATA_ROW_COUNT}" pool="${3:-$SHARED_COMPUTE_POOL_NAME}"
   local categories=(A B) suffix tmpfile name phase i offset val cat sep pool_type
 
@@ -834,13 +1043,13 @@ run_verify_statement() {
 cmd_verify() {
   require_cmds confluent jq
   ensure_cmf_port_forward
-  require_confluent_login
+  require_cmf_access
   local env="${1:-prod}"
   local probe_table="__verify_probe"
   log "Running startup verification statements in environment '$env'"
   run_verify_statement "$env" verify-show-tables "SHOW TABLES;"
   # Uses its own disposable table rather than depending on any pre-existing
-  # topic, so this works standalone even before ./demo.sh statement has run.
+  # topic, so this works standalone even before ./demo.sh demo-pipeline has run.
   run_verify_statement "$env" verify-create-probe \
     "CREATE TABLE IF NOT EXISTS ${probe_table} (\`id\` STRING, \`value\` INT) DISTRIBUTED INTO 1 BUCKETS;"
   run_verify_statement "$env" verify-describe-probe "DESCRIBE ${probe_table};"
@@ -851,7 +1060,7 @@ cmd_verify() {
 cmd_application() {
   require_cmds confluent
   ensure_cmf_port_forward
-  require_confluent_login
+  require_cmf_access
   local env="${1:-prod}"
   local file="${2:-$APPLICATION_FILE}"
   [[ -f "$file" ]] || die "application file not found: $file"
@@ -885,6 +1094,7 @@ cmd_status() {
 }
 
 cmd_up() {
+  cmd_check_quotas
   cmd_cluster
   cmd_helm_repo
   cmd_namespace
@@ -894,7 +1104,7 @@ cmd_up() {
   cmd_flink_operator
   if [[ "$CMF_ARTIFACTS_ENABLED" == "true" ]]; then cmd_artifacts; fi
   cmd_cmf
-  cmd_port_forward
+  cmd_cmf_forward
   cmd_c3_forward
   cmd_flink_environments
   cmd_catalog
@@ -902,8 +1112,11 @@ cmd_up() {
   for env in $FLINK_ENVIRONMENTS; do
     cmd_verify "$env"
   done
-  log "Environment is up. CMF: ${CONFLUENT_CMF_URL} - Control Center: http://localhost:${C3_LOCAL_PORT}/home"
-  log "Try: ./demo.sh statement, then ./demo.sh status"
+  local open_cmd="./demo.sh --${CLOUD} --user ${CFLT_USER}"
+  log "Environment is up"
+  log "CMF web UI: ${CONFLUENT_CMF_URL}/  (REST API: ${CONFLUENT_CMF_URL}/cmf/api/v1)"
+  log "C3 web UI: http://localhost:${C3_LOCAL_PORT}/home"
+  log "(or open these in a browser: '${open_cmd} cmf-ui' / '${open_cmd} c3-ui')"
 }
 
 cmd_down() {
@@ -1055,48 +1268,57 @@ Cloud selection (required for every subcommand except help/-h/--help):
     ./demo.sh up --aws --user myusername
 
 Full flow:
-  up                    Run every step below in order (cluster -> ... -> compute pools)
-  down [--yes]           Stop port-forwards and delete the GKE/EKS cluster
+  up                      Run all the steps under "Steps run by up" below, in order
+  down [--yes]            Stop port-forwards and delete the GKE/EKS cluster
 
-Individual steps (same order as `up`):
-  cluster                Create the GKE/EKS cluster and fetch kubectl credentials
+Steps run by `up` (in this order; each is also runnable standalone):
+   1  check-quotas        Preflight cloud quotas before anything is created;
+                          warns on any exceeded quota and asks whether to proceed
+                          (default no). AWS: VPCs/internet gateways/Elastic IPs per
+                          region + NAT gateways per AZ. GCP: not implemented, no-op
+   2  cluster             Create the GKE/EKS cluster and fetch kubectl credentials
                           (EKS also installs the EBS CSI driver add-on and a
                           default gp3 StorageClass, so PVCs bind like on GKE)
-  helm-repo               Add/update the confluentinc helm repo
-  namespace               Create the confluent namespace and set it as default context
-  operator                Install the confluent-for-kubernetes operator
-  kafka                   Apply cp/cp.yaml (Kafka, Schema Registry, Control Center)
-  cert-manager            Install cert-manager (required by the Flink k8s operator)
-  flink-operator          Create prod/test namespaces, install the Flink Kubernetes Operator
-  cmf                     Install Confluent Manager for Apache Flink (CMF)
-  artifacts               Provision blob storage for CMF 2.4 artifacts (per-user bucket +
-                          scoped static creds in a K8s secret). Only when
-                          CMF_ARTIFACTS_ENABLED=true; `up` runs it before cmf. See config.sh.
-  port-forward            Start a background port-forward to cmf-service:8080
-  stop-port-forward       Stop all background port-forwards started by this script
-  flink-environments      Create the prod/test Flink environments in CMF
-  catalog                 Create the Kafka catalog + database (flink/catalogv2.json, databasev2.json)
-  compute-pool            Create the DEDICATED pool (flink/compute-pool.json) and SHARED pool
-                          (flink/compute-pool-shared.json) in prod and test
-  verify [env]            Create/describe/drop a disposable table on the shared pool to
-                          sanity-check the environment (default env: prod)
-  statement [env] [pool]  Create demo_events/demo_aggregated, seed demo data, and start the
-                          continuous windowed-aggregation job (default env: prod). By default
-                          every step runs on shared-pool (fast - no cold start); pass a pool
-                          name to force a different pool for all steps, e.g.
-                          "statement prod pool" runs the data load on the DEDICATED pool
+   3  helm-repo           Add/update the confluentinc helm repo
+   4  namespace           Create the confluent namespace and set it as default context
+   5  operator            Install the confluent-for-kubernetes operator
+   6  kafka               Apply cp/cp.yaml (Kafka, Schema Registry, Control Center)
+   7  cert-manager        Install cert-manager (required by the Flink k8s operator)
+   8  flink-operator      Create prod/test namespaces, install the Flink Kubernetes Operator
+   9  artifacts           Provision blob storage for CMF 2.4 artifacts (per-user bucket +
+                          scoped static creds in a K8s secret). Conditional - only runs
+                          when CMF_ARTIFACTS_ENABLED=true. See config.sh.
+  10  cmf                 Install Confluent Manager for Apache Flink (CMF)
+  11  cmf-forward         Start a background port-forward to cmf-service:8080 (CMF UI/API)
+  12  c3-forward          Start a background port-forward to Control Center on :9021
+  13  flink-environments  Create the prod/test Flink environments in CMF
+  14  catalog             Create the Kafka catalog + database (flink/catalogv2.json, databasev2.json)
+  15  compute-pool        Create the DEDICATED pool (flink/compute-pool.json) and SHARED pool
+                          (flink/compute-pool-shared.json) in prod and test, then wait for
+                          shared-pool to reach RUNNING
+  16  verify [env]        Create/describe/drop a disposable table on the shared pool to
+                          sanity-check the environment. Repeated once per environment in
+                          FLINK_ENVIRONMENTS (default: prod and test)
+
+Standalone commands (not run by `up`):
+  demo-pipeline [env] [pool]  Create demo_events/demo_aggregated, seed demo data, and start
+                          the continuous windowed-aggregation job (default env: prod). By
+                          default every step runs on shared-pool (fast - no cold start); pass a
+                          pool name to force a different pool for all steps, e.g.
+                          "demo-pipeline prod pool" runs the data load on the DEDICATED pool
                           (slower, but confirms COMPLETED).
   generate-data [env] [count] [pool]  Insert more random rows into demo_events on demand
                           (default env: prod, count: 20, pool: shared-pool -
                           pass e.g. "pool" as 3rd arg to use the DEDICATED
                           pool instead, which is slower but confirms COMPLETED)
   application [env] [file] Deploy a simple FlinkApplication (default env: prod, default file: app/cpf_basic_app.json)
-
-Utilities:
-  c3-forward              Start a background port-forward to Control Center on :9021
-  cmf-ui                  Ensure the CMF port-forward and open the CMF 2.4 web UI
-                          (served at the root of :8080, same port as the REST API)
+  cmf-ui                  Ensure the CMF port-forward (same as step 11) and open the CMF 2.4
+                          web UI in a browser (root of :8080, same port as the REST API)
+  c3-ui                   Ensure the Control Center port-forward (same as step 12) and open
+                          the C3 web UI in a browser (http://localhost:9021/home)
   status                  Show pod status and Flink environments
+  stop-port-forward       Stop all background port-forwards started by this script
+                          (both the CMF and Control Center forwards)
   help                    Show this message
 
 Config can be overridden via environment variables, e.g.:
@@ -1121,6 +1343,9 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "--user requires a value, e.g. --user myusername"
       CFLT_USER="$2"; shift 2 ;;
     --user=*) CFLT_USER="${1#--user=}"; shift ;;
+    # Catch near-misses like --username/--user-name before they fall through to the
+    # positional catch-all and surface later as the confusing "--user is required".
+    --user*) die "unknown option '$1' - did you mean --user? (e.g. --user myusername)" ;;
     *) POSITIONAL+=("$1"); shift ;;
   esac
 done
@@ -1178,6 +1403,7 @@ fi
 case "$sub" in
   up) cmd_up "$@" ;;
   down) cmd_down "$@" ;;
+  check-quotas) cmd_check_quotas "$@" ;;
   cluster) cmd_cluster "$@" ;;
   helm-repo) cmd_helm_repo "$@" ;;
   namespace) cmd_namespace "$@" ;;
@@ -1185,16 +1411,17 @@ case "$sub" in
   kafka) cmd_kafka "$@" ;;
   c3-forward) cmd_c3_forward "$@" ;;
   cmf-ui) cmd_cmf_ui "$@" ;;
+  c3-ui) cmd_c3_ui "$@" ;;
   cert-manager) cmd_cert_manager "$@" ;;
   flink-operator) cmd_flink_operator "$@" ;;
   cmf) cmd_cmf "$@" ;;
   artifacts) cmd_artifacts "$@" ;;
-  port-forward) cmd_port_forward "$@" ;;
+  cmf-forward) cmd_cmf_forward "$@" ;;
   stop-port-forward) cmd_stop_port_forward "$@" ;;
   flink-environments) cmd_flink_environments "$@" ;;
   catalog) cmd_catalog "$@" ;;
   compute-pool) cmd_compute_pool "$@" ;;
-  statement) cmd_statement "$@" ;;
+  demo-pipeline) cmd_demo_pipeline "$@" ;;
   generate-data) cmd_generate_data "$@" ;;
   verify) cmd_verify "$@" ;;
   application) cmd_application "$@" ;;

@@ -19,8 +19,6 @@
 # Deliberately NOT named AWS_REGION: that's also the standard AWS CLI/SDK
 # environment variable, so if it's already set in your shell (common with
 # AWS SSO/profile setups) it would silently win over the default below.
-# eu-central-1 (not eu-west-1) because the shared account's eu-west-1 is at its
-# per-AZ NAT-gateway quota, which makes eksctl cluster creation fail.
 : "${EKS_REGION:=eu-central-1}"
 # The actual cluster name is always "<prefix>-<cflt-username>" (see demo.sh),
 # so people sharing an AWS account/region never collide on the same cluster.
@@ -54,7 +52,7 @@
 # Artifact management (upload Flink JARs to blob storage, reference via cmf://).
 # OFF by default: enabling it REQUIRES a basePath or CMF refuses to start, so set
 # BOTH of the following to turn it on.
-: "${CMF_ARTIFACTS_ENABLED:=false}"             # cmf.artifacts.enabled - opt-in; when true, `up` also runs cmd_artifacts (creates bucket + creds) before cmf
+: "${CMF_ARTIFACTS_ENABLED:=true}"             # cmf.artifacts.enabled - opt-in; when true, `up` also runs cmd_artifacts (creates bucket + creds) before cmf
 : "${CMF_ARTIFACTS_BASE_PATH:=}"                # cmf.artifacts.basePath - leave empty to derive as <scheme>://<bucket>/cmf (see demo.sh); override to bring your own path
 
 # --- CMF artifact storage (blob storage the script provisions per user) ---
@@ -104,7 +102,7 @@ export CONFLUENT_CMF_URL
 : "${COMPUTE_POOL_FILE:=flink/compute-pool.json}"
 : "${SHARED_COMPUTE_POOL_NAME:=shared-pool}"
 : "${SHARED_COMPUTE_POOL_FILE:=flink/compute-pool-shared.json}"
-: "${STATEMENT_NAME:=flink-statement}"
+: "${STATEMENT_NAME:=streaming-aggregation}"   # name of the long-running streaming job (step 4 of `demo-pipeline`); stays RUNNING
 : "${CREATE_EVENTS_SQL_FILE:=sql/create_demo_events.sql}"
 : "${CREATE_AGGREGATED_SQL_FILE:=sql/create_demo_aggregated.sql}"
 : "${INSERT_DEMO_DATA_SQL_FILE:=sql/insert_demo_data.sql}"

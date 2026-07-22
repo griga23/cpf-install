@@ -26,8 +26,18 @@ AWS (`--aws`):
   `demo.sh` verifies your identity before touching AWS, but never manages
   credentials or assumes roles on your behalf.
 
-> ⚠️ Make sure you are not logged into Confluent Cloud or any Confluent Platform environment from your
-> Confluent CLI, before proceeding: `confluent logout`
+> ⚠️ The `confluent flink` commands refuse to run while a Confluent Cloud or
+> Confluent Platform context is selected (`Error: you must log out of Confluent
+> Cloud to use this command`). `confluent logout` is **not** enough — it drops the
+> credential but leaves the context selected as `current_context`. Log out **and**
+> delete every context before proceeding (they only talk to CMF via
+> `$CONFLUENT_CMF_URL` regardless):
+>
+> ```sh
+> confluent logout
+> confluent context list          # note the Name of each context
+> confluent context delete <name>  # repeat for every context listed
+> ```
 
 ## Quick start
 
@@ -35,23 +45,49 @@ AWS (`--aws`):
 resource created (`cflt_managed_by=user`, `cflt_managed_id=<name>`) on both
 clouds.
 
-```sh
-# GCP
-./demo.sh --gcp --user myusername up          # cluster, Kafka, CMF, Flink operator, environments, catalog, compute pools
-./demo.sh --gcp --user myusername cmf-ui       # open the CMF 2.4 web UI (http://localhost:8080/)
-./demo.sh --gcp --user myusername c3-forward   # port forward for Confluent Control Center (C3) UI; accessible on http://localhost:9021/home
-./demo.sh --gcp --user myusername statement    # create tables, seed data, start the streaming aggregation job (prod)
-./demo.sh --gcp --user myusername status       # check pod health and list Flink environments
-./demo.sh --gcp --user myusername down         # stop port-forwards and delete the GKE cluster
+`up` is a composition root: it runs ~15 substeps in sequence (cluster → Kafka →
+CMF → Flink operator → environments → catalog → compute pools → CMF and 
+Control Center (C3) port-forwards → verify) — see the 
+[Command reference](#command-reference) for the full ordered list. 
 
-# AWS
-./demo.sh --aws --user myusername up
-./demo.sh --aws --user myusername cmf-ui       # open the CMF 2.4 web UI (http://localhost:8080/)
-./demo.sh --aws --user myusername c3-forward   # port forward for Confluent Control Center (C3) UI; accessible on http://localhost:9021/home
-./demo.sh --aws --user myusername statement
-./demo.sh --aws --user myusername status
-./demo.sh --aws --user myusername down
+The two port-forwards are the CMF UI/API on `localhost:8080`
+and Confluent Control Center on `localhost:9021`. 
+
+Everything below `up` is an **optional follow-up**, not a step you must run 
+in order; in particular, `up` has *already* started both of these port-forwards.
+
+### GCP
+
+```sh
+# 1. Stand up everything (cluster → Kafka → CMF → Flink → pools → both port-forwards → verify)
+./demo.sh --gcp --user myusername up
+
+# Then, as needed:
+./demo.sh --gcp --user myusername cmf-ui         # open the CMF 2.4 web UI in a browser (http://localhost:8080/)
+./demo.sh --gcp --user myusername c3-ui          # open the Control Center (C3) web UI in a browser (http://localhost:9021/home)
+./demo.sh --gcp --user myusername demo-pipeline  # run the demo pipeline: create tables, seed data, start the streaming job (prod)
+./demo.sh --gcp --user myusername status         # check pod health and list Flink environments
+./demo.sh --gcp --user myusername down           # stop port-forwards and delete the GKE cluster
 ```
+
+### AWS
+
+```sh
+# 1. Stand up everything (cluster → Kafka → CMF → Flink → pools → both port-forwards → verify)
+./demo.sh --aws --user myusername up
+
+# Then, as needed:
+./demo.sh --aws --user myusername cmf-ui         # open the CMF 2.4 web UI in a browser (http://localhost:8080/)
+./demo.sh --aws --user myusername c3-ui          # open the Control Center (C3) web UI in a browser (http://localhost:9021/home)
+./demo.sh --aws --user myusername demo-pipeline  # run the demo pipeline: create tables, seed data, start the streaming job (prod)
+./demo.sh --aws --user myusername status         # check pod health and list Flink environments
+./demo.sh --aws --user myusername down           # stop port-forwards and delete the EKS cluster
+```
+
+> **If a port-forward drops** (e.g. after a CMF or Control Center pod restart —
+> `kubectl port-forward` doesn't auto-reconnect), re-run `cmf-forward` (CMF,
+> `:8080`) or `c3-forward` (Control Center, `:9021`) to restart it. `up` starts
+> both, but doesn't keep them alive.
 
 **With CMF 2.4 artifact storage.** Set `CMF_ARTIFACTS_ENABLED=true` to also
 provision blob storage (a per-user bucket + scoped creds) and wire it into CMF
@@ -118,7 +154,8 @@ Artifact management (upload/version Flink JARs to blob storage, reference via
 `CMF_ARTIFACTS_ENABLED=true`; the `artifacts` step (run automatically by `up`
 before `cmf`) provisions everything and `down` tears it back down:
 
-- A per-user bucket **`cpf-artifacts-<user>`** (GCS on GCP, S3 on AWS).
+- A per-user bucket **`cpf-artifacts-<user>`** (GCS on GCP, S3 on AWS). 
+  You can modify the prefix changing `ARTIFACTS_BUCKET_PREFIX` in `config.sh`.
 - **Script-minted, bucket-scoped static credentials** — an AWS IAM user + access
   key, or a GCP service account + JSON key — stored in the K8s secret
   `cmf-artifacts-creds` in the `confluent` namespace and replicated to each Flink
@@ -153,35 +190,65 @@ keys may be blocked by org policy — the step fails with a clear message if so.
 
 ## Command reference
 
-Every step is also runnable standalone — e.g. after editing
+Every subcommand is also runnable standalone — e.g. after editing
 `flink/compute-pool.json`, just run `./demo.sh --gcp --user <name> compute-pool`
 (or `--aws --user <name>`). All subcommands require a cloud (`--gcp`/`--aws`)
 and `--user <name>` (see Quick start); both are omitted below for brevity.
 
+### Steps run by `up`
+
+`up` is not a step itself — it runs the steps below, **in this exact order**.
+Each is also runnable standalone (e.g. to re-run or resume a partial install):
+
+
+| # | Step | What it does |
+|---|---|---|
+| 1 | `check-quotas` | Checks cloud quotas for the resources that will be created. Warns on any exceeded quota and asks whether to proceed (default no). **AWS:** VPCs, internet gateways, and Elastic IPs per region + NAT gateways per AZ. **GCP:** not implemented yet (no-op). |
+| 2 | `cluster` | Creates the GKE/EKS cluster, fetches `kubectl` credentials. On AWS, also installs the EBS CSI driver add-on + a default `gp3` `StorageClass` (GKE ships with a default StorageClass already) |
+| 3 | `helm-repo` | Adds/updates the `confluentinc` helm repo |
+| 4 | `namespace` | Creates the `confluent` namespace, sets it as default context |
+| 5 | `operator` | Installs the `confluent-for-kubernetes` operator |
+| 6 | `kafka` | Applies `cp/cp.yaml` (Kafka, Schema Registry, Control Center) |
+| 7 | `cert-manager` | Installs cert-manager (required by the Flink Kubernetes Operator) |
+| 8 | `flink-operator` | Creates `prod`/`test` namespaces, installs the Flink Kubernetes Operator |
+| 9 | `artifacts` | Provisions blob storage for CMF 2.4 artifacts: a per-user bucket + scoped static creds in a K8s secret. **Conditional** — only runs when `CMF_ARTIFACTS_ENABLED=true` |
+| 10 | `cmf` | Installs Confluent Manager for Apache Flink |
+| 11 | `cmf-forward` | Background port-forward `cmf-service` → `localhost:8080` (CMF UI/API) |
+| 12 | `c3-forward` | Background port-forward for Control Center → `localhost:9021` |
+| 13 | `flink-environments` | Creates the `prod`/`test` CMF environments |
+| 14 | `catalog` | Creates/updates the `kafka-cat` catalog and `kafka-db` database, with DDL permissions |
+| 15 | `compute-pool` | Creates/updates the `pool` (DEDICATED) and `shared-pool` (SHARED) compute pools, and waits for `shared-pool` to reach `RUNNING` |
+| 16 | `verify [env]` | Sanity-checks the environment by running a short sequence of Flink statements — `SHOW TABLES`, then create / describe / show-create / **drop** a throwaway `__verify_probe` table — and **deletes each statement afterward**, so nothing persists. **Repeated once per environment** in `FLINK_ENVIRONMENTS` (default `prod` and `test`). Does **not** create the demo pipeline (that's `demo-pipeline`, below) |
+
+
+> ℹ️ **What `up` does and doesn't create.** During `up` you'll see Flink tables and
+> statements being created and dropped — that's the `verify` step (16), which creates
+> and immediately drops a throwaway `__verify_probe` table and deletes its own
+> statements. `up` leaves **no** persistent tables or statements. The demo pipeline
+> tables (`demo_events`, `demo_aggregated`), the seed data, and the continuous
+> streaming-aggregation job are created **only** by the standalone `demo-pipeline` command
+> — `up` never runs it.
+
+> ℹ️ The `up` command is idempotent. If it stops for any reasons, run it again.
+
+> ⚠️  If `up` was interrupted after having created cloud recources that are subhect to quotas, when you re-run `up` 
+> the `check-quotas` step may show a warning because no *further* resources of a given type can be created. 
+> However, these resources were created in the previous run, and `up` will not create more. In this case, you 
+> can safely ignore the warning and let `up` continue.
+
+### Standalone commands (not run by `up`)
+
+Run these yourself, as needed, after `up`:
+
 | Subcommand | What it does |
 |---|---|
-| `up` | Runs everything below, in order |
-| `cluster` | Creates the GKE/EKS cluster, fetches `kubectl` credentials. On AWS, also installs the EBS CSI driver add-on + a default `gp3` `StorageClass` (GKE ships with a default StorageClass already) |
-| `helm-repo` | Adds/updates the `confluentinc` helm repo |
-| `namespace` | Creates the `confluent` namespace, sets it as default context |
-| `operator` | Installs the `confluent-for-kubernetes` operator |
-| `kafka` | Applies `cp/cp.yaml` (Kafka, Schema Registry, Control Center) |
-| `cert-manager` | Installs cert-manager (required by the Flink Kubernetes Operator) |
-| `flink-operator` | Creates `prod`/`test` namespaces, installs the Flink Kubernetes Operator |
-| `cmf` | Installs Confluent Manager for Apache Flink |
-| `artifacts` | Provisions blob storage for CMF 2.4 artifacts: a per-user bucket + scoped static creds in a K8s secret. Only runs when `CMF_ARTIFACTS_ENABLED=true` (and `up` runs it automatically before `cmf`) |
-| `port-forward` | Background port-forward `cmf-service` → `localhost:8080` |
-| `stop-port-forward` | Stops all background port-forwards started by this script |
-| `flink-environments` | Creates the `prod`/`test` CMF environments |
-| `catalog` | Creates/updates the `kafka-cat` catalog and `kafka-db` database, with DDL permissions |
-| `compute-pool` | Creates/updates the `pool` (DEDICATED) and `shared-pool` (SHARED) compute pools |
-| `verify [env]` | Sanity-checks the environment via a disposable table (default `prod`) |
-| `statement [env] [pool]` | Runs the full stream-processing demo pipeline (default `prod`). By default every step runs on `shared-pool` (fast — no cold start); pass a pool name to force a different pool for all steps (e.g. `statement prod pool` runs the data load on the DEDICATED `pool`, which confirms COMPLETED but is slower) |
+| `demo-pipeline [env] [pool]` | Runs the full stream-processing demo pipeline (default `prod`). By default every step runs on `shared-pool` (fast — no cold start); pass a pool name to force a different pool for all steps (e.g. `demo-pipeline prod pool` runs the data load on the DEDICATED `pool`, which confirms COMPLETED but is slower) |
 | `generate-data [env] [count] [pool]` | Inserts more random rows into `demo_events` on demand (default `prod`, `20` rows, `shared-pool`) |
 | `application [env] [file]` | Deploys a raw `FlinkApplication` (default `prod`, `app/cpf_basic_app.json`) |
-| `c3-forward` | Background port-forward for Control Center → `localhost:9021` |
-| `cmf-ui` | Ensures the CMF port-forward and opens the CMF 2.4 web UI (root of `localhost:8080`, same port as the REST API) |
+| `cmf-ui` | Ensures the CMF port-forward (same as step 11) and opens the CMF 2.4 web UI in a browser (root of `localhost:8080`, same port as the REST API) |
+| `c3-ui` | Ensures the Control Center port-forward (same as step 12) and opens the C3 web UI in a browser (`http://localhost:9021/home`) |
 | `status` | Shows pod health, Flink environments, and port-forward status |
+| `stop-port-forward` | Stops all background port-forwards started by this script (both the CMF and Control Center forwards) |
 | `down [--yes]` | Stops port-forwards, deletes the GKE/EKS cluster. On AWS, PVCs are marked for deletion first, then their EBS volumes actually release as `eksctl` drains the nodegroup; a final check warns about any leftover volume |
 
 ## The demo pipeline
@@ -193,35 +260,55 @@ Two compute pools are available:
 | `shared-pool` | SHARED | DDL, ad hoc queries, the continuous streaming job, and (by default) the seed-data insert — fast, no per-job cold start |
 | `pool` | DEDICATED | One-shot bounded jobs where you want verifiable `COMPLETED` (bounded jobs never report finished on `shared-pool` — see [Troubleshooting](#troubleshooting)) |
 
-`./demo.sh statement [env] [pool]` runs four SQL statements in sequence against a
+`./demo.sh demo-pipeline [env] [pool]` runs four SQL statements in sequence against a
 self-contained schema (CMF only accepts one statement per submission, so these
 can't be combined into a single script). **By default every step runs on
 `shared-pool`** (fastest); pass a pool name to force a different pool for all
-steps — e.g. `statement prod pool` runs the bounded seed insert on the DEDICATED
+steps — e.g. `demo-pipeline prod pool` runs the bounded seed insert on the DEDICATED
 `pool` so its completion is verifiable (slower, cold start):
 
-| # | SQL file | Pool (default) | Result |
-|---|---|---|---|
-| 1 | `sql/create_demo_events.sql` | `shared-pool` | `demo_events` table, watermarked on `event_time` |
-| 2 | `sql/create_demo_aggregated.sql` | `shared-pool` | `demo_aggregated` table for windowed results |
-| 3 | `sql/insert_demo_data.sql` | `shared-pool` | 10 seed rows, timestamped relative to `CURRENT_TIMESTAMP` (always "fresh"); on `shared-pool` completion isn't verifiable, so it uses a short grace period |
-| 4 | `sql/streaming_aggregation.sql` | `shared-pool` | Continuous 30s tumbling-window aggregation, left `RUNNING` as `flink-statement` |
+| # | Statement name | SQL file | Produces | After it runs |
+|---|---|---|---|---|
+| 1 | `create-demo-events` | `sql/create_demo_events.sql` | `demo_events` table, watermarked on `event_time` | statement **deleted** (table persists) |
+| 2 | `create-demo-aggregated` | `sql/create_demo_aggregated.sql` | `demo_aggregated` table for windowed results | statement **deleted** (table persists) |
+| 3 | `insert-demo-data` | `sql/insert_demo_data.sql` | 10 seed rows in `demo_events`, timestamped relative to `CURRENT_TIMESTAMP` (always "fresh"); on `shared-pool` completion isn't verifiable, so it uses a short grace period | statement **deleted** (rows persist) |
+| 4 | `streaming-aggregation` | `sql/streaming_aggregation.sql` | Continuous 30s tumbling-window aggregation, `demo_events` → `demo_aggregated` | **kept — stays `RUNNING`** |
+
+Statements 1–3 are one-shot: the script runs each, waits for it to finish, then
+**deletes the statement resource**, so only their effects (the two tables and the
+seed rows) persist. **Only statement 4, `streaming-aggregation`, is left running** —
+it's the single statement you'll see under _Flink Environment > `<env>` >
+Statements_ in the CMF or C3 UI. (All steps run on `shared-pool` by default; the
+2nd positional arg overrides the pool for every step, as noted above.)
 
 Safe to re-run: `CREATE TABLE` uses `IF NOT EXISTS`, the seed insert just adds
 another batch of rows, and step 4 is skipped with a warning if
-`flink-statement` already exists.
+`streaming-aggregation` already exists.
 
 `./demo.sh catalog` sets `spec.ddlEnvironments: ["prod", "test"]` on
 `kafka-db` (`flink/databasev2.json`), which is what lets `CREATE TABLE`/
 `DROP TABLE` work in both environments from the start.
 
-Once `flink-statement` is running, feed it more data any time with
+Once `streaming-aggregation` is running, feed it more data any time with
 `./demo.sh generate-data [env] [count]` — see [Common tasks](#common-tasks).
 
 ## Common tasks
 
 The examples below use `--gcp` and omit the now-required `--user <name>` for
 brevity — add it to each command (or use `--aws --user <name>` for EKS).
+
+> ℹ️ **Bare `confluent flink ...` commands need `CONFLUENT_CMF_URL`.** Unlike
+> `./demo.sh` subcommands (which export it for you from `config.sh`), a raw
+> `confluent` command run in your own shell has no CMF URL and fails with
+> `Error: url is required`. Once per shell, make sure the CMF port-forward is up
+> and export the URL:
+>
+> ```sh
+> ./demo.sh --aws --user <name> cmf-forward     # ensure the CMF port-forward is up
+> export CONFLUENT_CMF_URL=http://localhost:8080
+> ```
+>
+> (or pass `--url http://localhost:8080` on each `confluent` command instead).
 
 **Generate more demo data.** Trigger this any time the streaming job needs
 fresh input — it inserts random rows (values 1-50, category `A`/`B`, spread
@@ -272,10 +359,10 @@ confluent flink shell --environment prod --compute-pool shared-pool
 
 ```sh
 confluent --environment prod flink statement list
-confluent --environment prod flink statement describe flink-statement
-confluent --environment prod flink statement web-ui-forward flink-statement
-confluent --environment prod flink statement stop flink-statement
-confluent --environment prod flink statement delete flink-statement --force
+confluent --environment prod flink statement describe streaming-aggregation
+confluent --environment prod flink statement web-ui-forward streaming-aggregation
+confluent --environment prod flink statement stop streaming-aggregation
+confluent --environment prod flink statement delete streaming-aggregation --force
 ```
 
 **Deploy the sample FlinkApplication** (`StateMachineExample.jar`):
@@ -298,7 +385,7 @@ them first: `confluent --environment <env> flink statement stop <name>`.)
 **Restart a dead port-forward:**
 
 ```sh
-./demo.sh --gcp port-forward      # CMF, localhost:8080
+./demo.sh --gcp cmf-forward       # CMF, localhost:8080
 ./demo.sh --gcp c3-forward        # Control Center, localhost:9021
 ```
 
@@ -388,7 +475,7 @@ confluent flink environment list \
 | Symptom | Fix |
 |---|---|
 | `up` hangs on a wait step | Check `kubectl -n confluent get pods`, re-run the subcommand once healthy |
-| `confluent flink ...` connection error | CMF port-forward died — run `./demo.sh --gcp port-forward` (or `--aws --user <name>`) |
+| `confluent flink ...` connection error | CMF port-forward died — run `./demo.sh --gcp cmf-forward` (or `--aws --user <name>`) |
 | DDL fails but `SELECT`/`INSERT` work | `ddlEnvironments` missing the environment — re-run `./demo.sh --gcp catalog` (or `--aws --user <name>`) |
 | Pod stuck `Pending` (`Insufficient cpu`) despite low `kubectl top nodes` usage | K8s schedules on CPU *requests*, not usage — lower `cpu` in the pool/app JSON, or bump `NUM_NODES`/`MACHINE_TYPE` |
 | Job crash-loops with a Kafka transaction timeout error | Add `/*+ OPTIONS('properties.transaction.timeout.ms'='300000') */` after `INSERT INTO` |
@@ -399,7 +486,8 @@ confluent flink environment list \
 | eksctl `up` fails with `would exceed the limit of N NAT gateways` | That region's per-AZ NAT-gateway quota is full (common on shared accounts) — retry in a different region, e.g. `EKS_REGION=<other-region> ./demo.sh --aws --user <name> up`. The default is `eu-central-1`; `eu-west-1` is known to be full on the shared account |
 | EKS pods stuck `Pending` with unbound PVCs (Kafka/SR/Control Center) | The EBS CSI driver/default `gp3` `StorageClass` didn't finish setting up — check `kubectl -n kube-system get pods -l app=ebs-csi-controller` and `kubectl get storageclass` (expect `gp3` marked `(default)`); re-run `./demo.sh --aws --user <name> cluster` to retry (idempotent) |
 | `aws`/`eksctl` commands fail with an auth error | Your assumed AWS profile expired or isn't set — re-run `export AWS_PROFILE=...` and confirm with `aws sts get-caller-identity` before retrying |
-| `confluent flink ...` fails with `Error: not logged in`, even though `confluent context list` shows a current context | That context's session token is stale/corrupted. This is unrelated to which cloud/CMF instance you're using — `confluent flink ...` commands talk to CMF purely via `CONFLUENT_CMF_URL`/`--url`, never through the login's own target. Fix: `confluent context list`, delete the broken context(s) with `confluent context delete <name>`, then `confluent login --save` (any login works — Confluent Cloud or Platform) and retry |
+| `demo.sh` dies with `ERROR: confluent CLI can't reach CMF` | A Confluent Cloud/Platform context is still selected — `confluent flink ...` refuses to run, and `confluent logout` alone doesn't clear it (it leaves the context as `current_context`). Log out **and** delete every context, then retry: `confluent logout`, then `confluent context list` (note each context Name) and `confluent context delete <name>` for every context listed. No re-login is needed — these commands reach CMF purely via `CONFLUENT_CMF_URL`/`--url` |
+| `up` failed partway through creating resources | Fix the underlying problem and just re-run `up` — every step is idempotent, so it skips what already exists and continues. On the re-run the `check-quotas` step may now warn about a quota that was fine the first time (e.g. VPCs/Elastic IPs per region): that's expected, because the resources created by the first (partial) run already count against the quota. Answer `y` at the prompt to proceed — you're reusing those existing resources, not creating additional ones |
 
 ## Teardown
 
