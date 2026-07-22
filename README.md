@@ -84,27 +84,20 @@ in order; in particular, `up` has *already* started both of these port-forwards.
 ./demo.sh --aws --user myusername down           # stop port-forwards and delete the EKS cluster
 ```
 
-> **If a port-forward drops** (e.g. after a CMF or Control Center pod restart —
-> `kubectl port-forward` doesn't auto-reconnect), re-run `cmf-forward` (CMF,
-> `:8080`) or `c3-forward` (Control Center, `:9021`) to restart it. `up` starts
-> both, but doesn't keep them alive.
-
-**With CMF 2.4 artifact storage.** Set `CMF_ARTIFACTS_ENABLED=true` to also
-provision blob storage (a per-user bucket + scoped creds) and wire it into CMF
-and the Flink pools during `up`; `down` cleans it up. See
-[Artifact storage](#artifact-storage-cmf-24) for details.
-
-```sh
-CMF_ARTIFACTS_ENABLED=true ./demo.sh --aws --user myusername up   # up, plus S3 bucket + IAM user/creds
-# GCP shared projects are often at their service-account quota - reuse an existing SA:
-CMF_ARTIFACTS_ENABLED=true ARTIFACTS_GCS_SA=<existing-sa-email> ./demo.sh --gcp --user myusername up
-```
-
 `--gcp`/`--aws` and `--user` may appear anywhere on the command line (before
 or after the subcommand). They're required for every subcommand except
 `help`/`-h`/`--help`.
 
 Run `./demo.sh help` any time for the full subcommand list.
+
+
+> **If a port-forward drops** (e.g. after a CMF or Control Center pod restart —
+> `kubectl port-forward` doesn't auto-reconnect), re-run `cmf-forward` (CMF,
+> `:8080`) or `c3-forward` (Control Center, `:9021`) to restart it. `up` starts
+> both, but doesn't keep them alive.
+
+> The Artifact Storage introduced with CMF 2.4 is disabled by default.
+> See [Artifact storage](#artifact-storage-cmf-24) for details about enabling it.
 
 ## Configuration
 
@@ -171,11 +164,33 @@ CMF_ARTIFACTS_ENABLED=true ./demo.sh --gcp --user <name> up          # bucket+cr
 CMF_ARTIFACTS_ENABLED=true ./demo.sh --aws --user <name> artifacts   # or provision the storage standalone
 ```
 
-**Shared GCP projects:** minting a new service account can fail if the project is at
-its service-account quota (common on shared projects). Set
-`ARTIFACTS_GCS_SA=<an-existing-sa-email>` to reuse an existing SA instead — the script
-grants it bucket access and mints a JSON key for it, and `down` deletes exactly that
-key (recorded on the secret) without touching the shared SA itself.
+### Using shared GCP Projects and AWS Accounts
+
+**GCP.** Minting a new service account can fail if the project is at its
+service-account quota (common on shared projects). Set
+`ARTIFACTS_GCS_SA=<an-existing-sa-email>` to reuse an existing SA instead — the
+script grants it bucket access and mints a JSON key for it, and `down` deletes
+exactly that key (recorded on the secret) without touching the shared SA itself.
+
+**AWS.** Two per-user names must stay unique, and both derive from
+`cpf-artifacts-<user>`:
+
+- The **S3 bucket** name is globally unique across *all* AWS accounts (not just
+  yours), so `create-bucket` fails with a name-conflict error if that name is
+  already taken by anyone, anywhere — not only by someone in your account. Use a
+  more distinctive `ARTIFACTS_BUCKET_PREFIX` (or `--user`) if you hit this.
+- The script also creates a bucket-scoped **IAM user** of the same name, plus an
+  access key stored in the `cmf-artifacts-creds` secret. IAM users are
+  account-wide, so a distinct `--user` is what keeps people sharing an account
+  from colliding (same idea as the cluster name); re-running reuses the existing
+  user rather than failing. `down` removes the access key, the IAM user, **and**
+  the bucket — nothing shared is touched, so AWS needs no `ARTIFACTS_GCS_SA`-style
+  "reuse an existing one" knob.
+
+On **either** cloud, org policy (an AWS SCP, or a GCP org/IAM constraint) may
+forbid minting the IAM user / access key or the service-account key. The
+`artifacts` step then fails with a clear message — you can instead supply your own
+bucket-scoped credentials directly in the `cmf-artifacts-creds` secret.
 
 Tunables (see `config.sh`): `ARTIFACTS_BUCKET_PREFIX` (default `cpf-artifacts`),
 `ARTIFACTS_GCS_LOCATION` (derived from `ZONE`), `ARTIFACTS_MAX_UPLOAD_SIZE`
@@ -185,8 +200,7 @@ pool/application). Left **empty by default**, which auto-derives the jar name
 from that spec's own image tag (`flink-<scheme>-fs-hadoop-<tag>.jar`) — set one
 explicitly only to override, e.g. if a `FlinkApplication` uses a different image
 than the compute pools (verify jar names with `ls /opt/flink/opt` in the image).
-Override `CMF_ARTIFACTS_BASE_PATH` to bring your own path. Minting IAM users / SA
-keys may be blocked by org policy — the step fails with a clear message if so.
+Override `CMF_ARTIFACTS_BASE_PATH` to bring your own path.
 
 ## Command reference
 

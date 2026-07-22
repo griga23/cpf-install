@@ -52,7 +52,7 @@
 # Artifact management (upload Flink JARs to blob storage, reference via cmf://).
 # OFF by default: enabling it REQUIRES a basePath or CMF refuses to start, so set
 # BOTH of the following to turn it on.
-: "${CMF_ARTIFACTS_ENABLED:=true}"             # cmf.artifacts.enabled - opt-in; when true, `up` also runs cmd_artifacts (creates bucket + creds) before cmf
+: "${CMF_ARTIFACTS_ENABLED:=false}"             # cmf.artifacts.enabled - opt-in; when true, `up` also runs cmd_artifacts (creates bucket + creds) before cmf
 : "${CMF_ARTIFACTS_BASE_PATH:=}"                # cmf.artifacts.basePath - leave empty to derive as <scheme>://<bucket>/cmf (see demo.sh); override to bring your own path
 
 # --- CMF artifact storage (blob storage the script provisions per user) ---
