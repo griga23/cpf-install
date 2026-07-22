@@ -164,11 +164,33 @@ CMF_ARTIFACTS_ENABLED=true ./demo.sh --gcp --user <name> up          # bucket+cr
 CMF_ARTIFACTS_ENABLED=true ./demo.sh --aws --user <name> artifacts   # or provision the storage standalone
 ```
 
-**Shared GCP projects:** minting a new service account can fail if the project is at
-its service-account quota (common on shared projects). Set
-`ARTIFACTS_GCS_SA=<an-existing-sa-email>` to reuse an existing SA instead — the script
-grants it bucket access and mints a JSON key for it, and `down` deletes exactly that
-key (recorded on the secret) without touching the shared SA itself.
+### Using shared GCP Projects and AWS Accounts
+
+**GCP.** Minting a new service account can fail if the project is at its
+service-account quota (common on shared projects). Set
+`ARTIFACTS_GCS_SA=<an-existing-sa-email>` to reuse an existing SA instead — the
+script grants it bucket access and mints a JSON key for it, and `down` deletes
+exactly that key (recorded on the secret) without touching the shared SA itself.
+
+**AWS.** Two per-user names must stay unique, and both derive from
+`cpf-artifacts-<user>`:
+
+- The **S3 bucket** name is globally unique across *all* AWS accounts (not just
+  yours), so `create-bucket` fails with a name-conflict error if that name is
+  already taken by anyone, anywhere — not only by someone in your account. Use a
+  more distinctive `ARTIFACTS_BUCKET_PREFIX` (or `--user`) if you hit this.
+- The script also creates a bucket-scoped **IAM user** of the same name, plus an
+  access key stored in the `cmf-artifacts-creds` secret. IAM users are
+  account-wide, so a distinct `--user` is what keeps people sharing an account
+  from colliding (same idea as the cluster name); re-running reuses the existing
+  user rather than failing. `down` removes the access key, the IAM user, **and**
+  the bucket — nothing shared is touched, so AWS needs no `ARTIFACTS_GCS_SA`-style
+  "reuse an existing one" knob.
+
+On **either** cloud, org policy (an AWS SCP, or a GCP org/IAM constraint) may
+forbid minting the IAM user / access key or the service-account key. The
+`artifacts` step then fails with a clear message — you can instead supply your own
+bucket-scoped credentials directly in the `cmf-artifacts-creds` secret.
 
 Tunables (see `config.sh`): `ARTIFACTS_BUCKET_PREFIX` (default `cpf-artifacts`),
 `ARTIFACTS_GCS_LOCATION` (derived from `ZONE`), `ARTIFACTS_MAX_UPLOAD_SIZE`
@@ -178,8 +200,7 @@ pool/application). Left **empty by default**, which auto-derives the jar name
 from that spec's own image tag (`flink-<scheme>-fs-hadoop-<tag>.jar`) — set one
 explicitly only to override, e.g. if a `FlinkApplication` uses a different image
 than the compute pools (verify jar names with `ls /opt/flink/opt` in the image).
-Override `CMF_ARTIFACTS_BASE_PATH` to bring your own path. Minting IAM users / SA
-keys may be blocked by org policy — the step fails with a clear message if so.
+Override `CMF_ARTIFACTS_BASE_PATH` to bring your own path.
 
 ## Command reference
 
