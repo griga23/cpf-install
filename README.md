@@ -121,20 +121,6 @@ AWS-specific defaults: `EKS_REGION` (`eu-central-1` — the shared account's
 `EKS_NODE_TYPE` (`m5.xlarge`). GCP-specific: `PROJECT`, `ZONE`
 (`europe-west1-b`), `NUM_NODES` (`3`), `MACHINE_TYPE` (`e2-standard-4`).
 
-### CMF 2.4 artifact storage
-
-
-Set `CMF_ARTIFACTS_ENABLED=true` in the `config.sh` to enable it and also
-provision blob storage (a per-user bucket + scoped creds) and wire it into CMF
-and the Flink pools during `up`; `down` cleans it up.
-
-```sh
-CMF_ARTIFACTS_ENABLED=true ./demo.sh --aws --user myusername up   # up, plus S3 bucket + IAM user/creds
-# GCP shared projects are often at their service-account quota - reuse an existing SA:
-CMF_ARTIFACTS_ENABLED=true ARTIFACTS_GCS_SA=<existing-sa-email> ./demo.sh --gcp --user myusername up
-```
-
-
 ### CMF 2.4 feature flags
 
 `cmd_cmf` wires the CMF 2.4 opt-in features as helm `--set` flags, controlled
