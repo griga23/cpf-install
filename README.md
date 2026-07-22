@@ -84,27 +84,20 @@ in order; in particular, `up` has *already* started both of these port-forwards.
 ./demo.sh --aws --user myusername down           # stop port-forwards and delete the EKS cluster
 ```
 
-> **If a port-forward drops** (e.g. after a CMF or Control Center pod restart —
-> `kubectl port-forward` doesn't auto-reconnect), re-run `cmf-forward` (CMF,
-> `:8080`) or `c3-forward` (Control Center, `:9021`) to restart it. `up` starts
-> both, but doesn't keep them alive.
-
-**With CMF 2.4 artifact storage.** Set `CMF_ARTIFACTS_ENABLED=true` to also
-provision blob storage (a per-user bucket + scoped creds) and wire it into CMF
-and the Flink pools during `up`; `down` cleans it up. See
-[Artifact storage](#artifact-storage-cmf-24) for details.
-
-```sh
-CMF_ARTIFACTS_ENABLED=true ./demo.sh --aws --user myusername up   # up, plus S3 bucket + IAM user/creds
-# GCP shared projects are often at their service-account quota - reuse an existing SA:
-CMF_ARTIFACTS_ENABLED=true ARTIFACTS_GCS_SA=<existing-sa-email> ./demo.sh --gcp --user myusername up
-```
-
 `--gcp`/`--aws` and `--user` may appear anywhere on the command line (before
 or after the subcommand). They're required for every subcommand except
 `help`/`-h`/`--help`.
 
 Run `./demo.sh help` any time for the full subcommand list.
+
+
+> **If a port-forward drops** (e.g. after a CMF or Control Center pod restart —
+> `kubectl port-forward` doesn't auto-reconnect), re-run `cmf-forward` (CMF,
+> `:8080`) or `c3-forward` (Control Center, `:9021`) to restart it. `up` starts
+> both, but doesn't keep them alive.
+
+> The Artifact Storage introduced with CMF 2.4 is disabled by default.
+> See [Artifact storage](#artifact-storage-cmf-24) for details about enabling it.
 
 ## Configuration
 
@@ -127,6 +120,20 @@ AWS-specific defaults: `EKS_REGION` (`eu-central-1` — the shared account's
 `eu-west-1` is at its per-AZ NAT-gateway quota, which fails eksctl), `EKS_NUM_NODES` (`3`),
 `EKS_NODE_TYPE` (`m5.xlarge`). GCP-specific: `PROJECT`, `ZONE`
 (`europe-west1-b`), `NUM_NODES` (`3`), `MACHINE_TYPE` (`e2-standard-4`).
+
+### CMF 2.4 artifact storage
+
+
+Set `CMF_ARTIFACTS_ENABLED=true` in the `config.sh` to enable it and also
+provision blob storage (a per-user bucket + scoped creds) and wire it into CMF
+and the Flink pools during `up`; `down` cleans it up.
+
+```sh
+CMF_ARTIFACTS_ENABLED=true ./demo.sh --aws --user myusername up   # up, plus S3 bucket + IAM user/creds
+# GCP shared projects are often at their service-account quota - reuse an existing SA:
+CMF_ARTIFACTS_ENABLED=true ARTIFACTS_GCS_SA=<existing-sa-email> ./demo.sh --gcp --user myusername up
+```
+
 
 ### CMF 2.4 feature flags
 
