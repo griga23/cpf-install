@@ -32,18 +32,18 @@
 : "${FLINK_ENVIRONMENTS:=prod test}"             # CMF environments to create (space separated)
 
 # --- Helm chart versions ---
-# NOTE: CMF and the Flink k8s operator are version-locked - CMF 2.4.0 requires
-# operator app version 1.15.0-cp2, which is helm CHART version 1.150.x (the chart
-# and app versions differ: chart 1.150.2 -> app 1.15.0-cp2). Bump both together.
+# NOTE: CMF and the Flink k8s operator are version-locked - CMF 2.5.0 is paired with
+# operator app version 1.16.1-cp1, which is helm CHART version 1.161.x (the chart
+# and app versions differ: chart 1.161.1 -> app 1.16.1-cp1). Bump both together.
 : "${CERT_MANAGER_VERSION:=v1.18.2}"
-: "${FLINK_OPERATOR_VERSION:=~1.150.0}"   # chart 1.150.x = app 1.15.0-cp2 (required by CMF 2.4.0)
-: "${CMF_VERSION:=~2.4.0}"
+: "${FLINK_OPERATOR_VERSION:=~1.161.0}"   # chart 1.161.x = app 1.16.1-cp1 (paired with CMF 2.5.0)
+: "${CMF_VERSION:=~2.5.0}"
 
-# --- CMF 2.4 feature flags (wired into cmd_cmf as helm --set) ---
-# Each key below maps to an EXACT chart value path - CMF 2.4 validates the Helm
+# --- CMF 2.5 feature flags (wired into cmd_cmf as helm --set) ---
+# Each key below maps to an EXACT chart value path - CMF 2.5 validates the Helm
 # values schema, so an unknown key fails the upgrade. Verify against:
-#   helm show values confluentinc/confluent-manager-for-apache-flink --version 2.4.0
-# Self-contained features default ON so a fresh `cmf` run exercises 2.4; set to
+#   helm show values confluentinc/confluent-manager-for-apache-flink --version 2.5.0
+# Self-contained features default ON so a fresh `cmf` run exercises 2.5; set to
 # false to opt out.
 : "${CMF_ENVIRONMENT_CATALOG_ENABLED:=true}"   # cmf.sql.environmentCatalog.enabled - CREATE FUNCTION ... USING JAR + custom connectors/formats (CREATE TABLE ... WITH ('connector'=...))
 : "${CMF_MCP_ENABLED:=true}"                    # cmf.mcp.enabled - MCP server at /cmf/mcp/v1alpha1 for AI agents (Claude Code, Cursor)
@@ -92,6 +92,10 @@
 : "${C3_LOCAL_PORT:=9021}"
 : "${CONFLUENT_CMF_URL:=http://localhost:${CMF_LOCAL_PORT}}"
 export CONFLUENT_CMF_URL
+# The script runs every `confluent` call with HOME pointed here, so the CLI uses a
+# private config dir: it never sees (or needs you to delete) your own Confluent
+# Cloud/Platform contexts, which would otherwise block `confluent flink`.
+: "${CONFLUENT_CLI_HOME:=${HOME}/.cache/cpf-demo/confluent-home}"
 
 # --- CMF resources: catalog, database, compute pools, demo pipeline ---
 : "${CATALOG_NAME:=kafka-cat}"
@@ -110,3 +114,7 @@ export CONFLUENT_CMF_URL
 : "${APPLICATION_FILE:=app/cpf_basic_app.json}"
 : "${GENERATE_DATA_ROW_COUNT:=20}"         # default rows for ./demo.sh generate-data
 : "${GENERATE_DATA_MAX_OFFSET_SECONDS:=90}" # spread new rows over the last N seconds
+
+# Seconds to let the bounded demo-data INSERT run on a SHARED pool before deleting it.
+# Must exceed job startup + one checkpoint interval (10s), or nothing gets committed.
+: "${SHARED_INSERT_GRACE_SECONDS:=30}"
