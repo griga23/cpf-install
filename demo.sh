@@ -33,21 +33,23 @@ require_aws_identity() {
     || die "aws CLI has no valid credentials (session expired, e.g. an SSO token, or AWS_PROFILE/credentials are wrong) - run 'aws sts get-caller-identity' to diagnose, re-authenticate (e.g. 'granted sso login ...' or re-export AWS_PROFILE), and retry"
 }
 
-# Catches a confusing failure mode: `confluent flink ...` REFUSES to run while a
-# Confluent Cloud or Confluent Platform context is selected, failing with
-# "you must log out of Confluent Cloud to use this command". `confluent logout` is
-# NOT enough - it drops the credential but leaves the context selected as
-# current_context, so the refusal persists. These subcommands only ever talk to CMF
-# via $CONFLUENT_CMF_URL/--url, so no login is needed (or wanted); deleting all
-# contexts clears current_context and unblocks them. (If no context is selected the
-# same probe can still fail because CMF is unreachable - hence the port-forward hint.)
+# Run the confluent CLI with an isolated HOME (see CONFLUENT_CLI_HOME in config.sh)
+# so a Confluent Cloud/Platform context selected in the user's own CLI config can't
+# block `confluent flink`, and so the script never has to delete the user's contexts.
+# Only `confluent` gets the alternate HOME - gcloud/kubectl/helm keep the real one.
+confluent() {
+  mkdir -p "$CONFLUENT_CLI_HOME"
+  HOME="$CONFLUENT_CLI_HOME" command confluent "$@"
+}
+
+# Preflight for every CMF-talking subcommand: probes `confluent flink environment
+# list`. (`confluent flink` refuses to run while a Cloud/Platform context is selected,
+# but the isolated HOME in the `confluent` wrapper above keeps user contexts out of
+# it, so a failure here normally means CMF itself is unreachable - hence the
+# port-forward hint.)
 require_cmf_access() {
   confluent flink environment list >/dev/null 2>&1 \
-    || die "confluent CLI can't reach CMF. Most likely a Confluent Cloud/Platform context is still selected ('confluent logout' does NOT clear it) - log out and delete every context, then retry:
-    confluent logout
-    confluent context list                 # note each context Name
-    confluent context delete <name>         # repeat for every context listed
-If no context is selected, make sure the CMF port-forward is up and \$CONFLUENT_CMF_URL ($CONFLUENT_CMF_URL) is reachable."
+    || die "confluent CLI can't reach CMF - make sure the CMF port-forward is up and \$CONFLUENT_CMF_URL ($CONFLUENT_CMF_URL) is reachable (check: kubectl -n $CONFLUENT_NAMESPACE get pods). The script runs the CLI with an isolated config dir ($CONFLUENT_CLI_HOME), so your own Confluent contexts are not the cause."
 }
 
 ensure_namespace() {
@@ -278,6 +280,10 @@ cmd_check_quotas() {
 # Query with: gcloud compute regions describe "${ZONE%-*}" --project "$PROJECT"
 #   --format="value(quotas)"  (or the Cloud Quotas API for SA/IAM limits).
 cmd_check_quotas_gcp() {
+  # Fail fast on expired/missing gcloud credentials (otherwise `up` only dies later,
+  # inside `gcloud container clusters create`, with a token-refresh error).
+  gcloud auth print-access-token >/dev/null 2>&1 \
+    || die "gcloud credentials are missing or expired - run: gcloud auth login"
   warn "GCP quota preflight not implemented yet - skipping (see TODO in cmd_check_quotas_gcp)"
 }
 
@@ -422,7 +428,7 @@ cmd_c3_forward() {
   log "Control Center reachable at http://localhost:${C3_LOCAL_PORT}/home"
 }
 
-# Convenience wrapper around the CMF port-forward that frames it as the CMF 2.4
+# Convenience wrapper around the CMF port-forward that frames it as the CMF 2.5
 # web UI (served at the root of the CMF service, same port as the REST API) and
 # opens it in a browser where possible.
 cmd_cmf_ui() {
@@ -460,7 +466,7 @@ cmd_flink_operator() {
   wait_pods_ready "$CONFLUENT_NAMESPACE" 180s
 }
 
-# Provisions the blob-storage bucket + scoped static credentials CMF 2.4 needs for
+# Provisions the blob-storage bucket + scoped static credentials CMF 2.5 needs for
 # artifact management, storing the creds in the K8s secret $ARTIFACTS_CREDS_SECRET.
 # Idempotent: bucket/IAM principal creation checks-then-skips, and credentials are
 # only minted when the secret is absent (so re-runs don't hit the AWS 2-keys limit).
@@ -669,7 +675,7 @@ render_spec_to_tmp() {
 cmd_cmf() {
   log "Installing Confluent Manager for Apache Flink (CMF) $CMF_VERSION"
   # Feature flags (see config.sh). Each --set maps to an exact chart value path;
-  # CMF 2.4 validates the values schema, so an unknown key fails the upgrade.
+  # CMF 2.5 validates the values schema, so an unknown key fails the upgrade.
   local set_args=(
     --set cmf.sql.production=false
     --set cmf.sql.environmentCatalog.enabled="$CMF_ENVIRONMENT_CATALOG_ENABLED"
@@ -700,6 +706,13 @@ cmd_cmf() {
           --set "extraEnv[1].name=AWS_SECRET_ACCESS_KEY"
           --set "extraEnv[1].valueFrom.secretKeyRef.name=${ARTIFACTS_CREDS_SECRET}"
           --set "extraEnv[1].valueFrom.secretKeyRef.key=aws-secret-access-key"
+          # CMF 2.5 compile workers do NOT inherit extraEnv - give them their own copy
+          --set "cmf.statementService.workers.extraEnv[0].name=AWS_ACCESS_KEY_ID"
+          --set "cmf.statementService.workers.extraEnv[0].valueFrom.secretKeyRef.name=${ARTIFACTS_CREDS_SECRET}"
+          --set "cmf.statementService.workers.extraEnv[0].valueFrom.secretKeyRef.key=aws-access-key-id"
+          --set "cmf.statementService.workers.extraEnv[1].name=AWS_SECRET_ACCESS_KEY"
+          --set "cmf.statementService.workers.extraEnv[1].valueFrom.secretKeyRef.name=${ARTIFACTS_CREDS_SECRET}"
+          --set "cmf.statementService.workers.extraEnv[1].valueFrom.secretKeyRef.key=aws-secret-access-key"
         )
         ;;
       gcp)
@@ -714,6 +727,15 @@ cmd_cmf() {
           --set "mountedVolumes.volumeMounts[0].name=gcs-creds"
           --set-string "mountedVolumes.volumeMounts[0].mountPath=/mnt/gcs"
           --set "mountedVolumes.volumeMounts[0].readOnly=true"
+          # CMF 2.5 compile workers do NOT inherit extraEnv/mountedVolumes - give them
+          # their own copy of the creds (mounts must be readOnly: true)
+          --set "cmf.statementService.workers.extraEnv[0].name=GCS_KEY_FILE"
+          --set-string "cmf.statementService.workers.extraEnv[0].value=/mnt/gcs/gcs-key.json"
+          --set "cmf.statementService.workers.mountedVolumes.volumes[0].name=gcs-creds"
+          --set "cmf.statementService.workers.mountedVolumes.volumes[0].secret.secretName=${ARTIFACTS_CREDS_SECRET}"
+          --set "cmf.statementService.workers.mountedVolumes.volumeMounts[0].name=gcs-creds"
+          --set-string "cmf.statementService.workers.mountedVolumes.volumeMounts[0].mountPath=/mnt/gcs"
+          --set "cmf.statementService.workers.mountedVolumes.volumeMounts[0].readOnly=true"
         )
         ;;
     esac
@@ -928,7 +950,11 @@ cmd_demo_pipeline() {
     --parallelism 1 \
     --sql "$(cat "$INSERT_DEMO_DATA_SQL_FILE")" >/dev/null
   if [[ "$insert_pool_type" == "SHARED" ]]; then
-    sleep 10
+    # The Kafka sink only commits its transaction on a checkpoint (10s interval in the
+    # shared pool) AFTER job startup, so deleting the statement any sooner cancels the
+    # load before a single record is committed (seen: demo_events left empty with a 10s
+    # grace). Tunable via SHARED_INSERT_GRACE_SECONDS in config.sh.
+    sleep "$SHARED_INSERT_GRACE_SECONDS"
     delete_statement_quiet "$env" insert-demo-data
     warn "insert ran on SHARED pool '$insert_pool' - completion isn't verifiable, but should already be done"
     log "Observe statements in the CMF or C3 UI: Flink Environment > $env > Statements"
@@ -1004,9 +1030,9 @@ cmd_generate_data() {
     # Bounded jobs on a SHARED pool actually finish in a couple of seconds,
     # but the statement gets stuck reporting RECONCILING/PENDING forever
     # instead of COMPLETED (operator quirk - see README troubleshooting), so
-    # there's no reliable phase to poll for. Give it a short grace period
-    # instead and move on.
-    sleep 10
+    # there's no reliable phase to poll for. Give it a grace period (longer than
+    # startup + one 10s checkpoint, or the sink never commits) and move on.
+    sleep "$SHARED_INSERT_GRACE_SECONDS"
     delete_statement_quiet "$env" "$name"
     log "Requested $count new events into 'demo_events' in '$env' (SHARED pool - completion isn't verifiable, but should already be done)"
   else
@@ -1142,9 +1168,57 @@ cmd_down_gcp() {
     gcs_key_id=$(echo "$ann" | jq -r '.metadata.annotations["cpf.artifacts/gcs-key-id"] // empty')
     gcs_sa=$(echo "$ann" | jq -r '.metadata.annotations["cpf.artifacts/gcs-sa"] // empty')
   fi
+  # Record the PD disks backing this cluster's PVs BEFORE deleting it: GKE leaves
+  # dynamically provisioned PV disks behind (Retain-like orphans) once the cluster is
+  # gone, and on a shared project they're otherwise indistinguishable from other
+  # people's. Taking the names from the PVs themselves is exact - no label/date guessing.
+  local pv_disks
+  pv_disks=$(list_cluster_pv_disks_gcp)
   log "Deleting GKE cluster '$CLUSTER_NAME'"
   gcloud container clusters delete "$CLUSTER_NAME" --zone "$ZONE" --project "$PROJECT" --quiet
+  delete_pv_disks_gcp "$pv_disks"
   teardown_artifacts_gcp "$gcs_key_id" "$gcs_sa"
+}
+
+# Prints "<disk-name> <zone>" for every GCE PD that backs a PV in this cluster. Uses an
+# explicit kubectl --context (the current context may point at another cluster) and
+# only trusts the PD CSI driver's volumeHandle (projects/<p>/zones/<z>/disks/<name>),
+# restricted to our project. Prints nothing (never fails) if the cluster is unreachable.
+list_cluster_pv_disks_gcp() {
+  command -v jq >/dev/null 2>&1 || return 0
+  local ctx="gke_${PROJECT}_${ZONE}_${CLUSTER_NAME}"
+  kubectl --context "$ctx" get pv -o json 2>/dev/null | jq -r --arg p "$PROJECT" '
+    .items[] | select(.spec.csi.driver == "pd.csi.storage.gke.io")
+    | .spec.csi.volumeHandle
+    | capture("^projects/(?<proj>[^/]+)/zones/(?<zone>[^/]+)/disks/(?<name>[^/]+)$")
+    | select(.proj == $p) | "\(.name) \(.zone)"' 2>/dev/null || true
+}
+
+# Deletes the disks listed by list_cluster_pv_disks_gcp (stdin-style arg: one
+# "<name> <zone>" per line). Cluster deletion detaches them asynchronously, so retry a
+# few times; a disk that's already gone is fine. Best-effort: warns, never aborts.
+delete_pv_disks_gcp() {
+  local list="${1:-}" name zone i
+  if [[ -z "$list" ]]; then
+    log "No PVC-backed disks recorded for '$CLUSTER_NAME' - nothing to clean up"
+    return 0
+  fi
+  log "Deleting PVC-backed disks left behind by the cluster"
+  while read -r name zone; do
+    [[ -n "$name" ]] || continue
+    if ! gcloud compute disks describe "$name" --zone "$zone" --project "$PROJECT" >/dev/null 2>&1; then
+      log "  disk $name already gone"
+      continue
+    fi
+    for i in 1 2 3 4 5 6; do
+      if gcloud compute disks delete "$name" --zone "$zone" --project "$PROJECT" --quiet >/dev/null 2>&1; then
+        log "  deleted disk $name"
+        continue 2
+      fi
+      sleep 10
+    done
+    warn "could not delete disk $name (zone $zone) - remove manually: gcloud compute disks delete $name --zone $zone --project $PROJECT"
+  done <<< "$list"
 }
 
 # Best-effort teardown of the artifact bucket, minted SA key, and (if we created one)
@@ -1285,7 +1359,7 @@ Steps run by `up` (in this order; each is also runnable standalone):
    6  kafka               Apply cp/cp.yaml (Kafka, Schema Registry, Control Center)
    7  cert-manager        Install cert-manager (required by the Flink k8s operator)
    8  flink-operator      Create prod/test namespaces, install the Flink Kubernetes Operator
-   9  artifacts           Provision blob storage for CMF 2.4 artifacts (per-user bucket +
+   9  artifacts           Provision blob storage for CMF 2.5 artifacts (per-user bucket +
                           scoped static creds in a K8s secret). Conditional - only runs
                           when CMF_ARTIFACTS_ENABLED=true. See config.sh.
   10  cmf                 Install Confluent Manager for Apache Flink (CMF)
@@ -1312,7 +1386,7 @@ Standalone commands (not run by `up`):
                           pass e.g. "pool" as 3rd arg to use the DEDICATED
                           pool instead, which is slower but confirms COMPLETED)
   application [env] [file] Deploy a simple FlinkApplication (default env: prod, default file: app/cpf_basic_app.json)
-  cmf-ui                  Ensure the CMF port-forward (same as step 11) and open the CMF 2.4
+  cmf-ui                  Ensure the CMF port-forward (same as step 11) and open the CMF 2.5
                           web UI in a browser (root of :8080, same port as the REST API)
   c3-ui                   Ensure the Control Center port-forward (same as step 12) and open
                           the C3 web UI in a browser (http://localhost:9021/home)

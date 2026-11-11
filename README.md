@@ -26,18 +26,12 @@ AWS (`--aws`):
   `demo.sh` verifies your identity before touching AWS, but never manages
   credentials or assumes roles on your behalf.
 
-> ⚠️ The `confluent flink` commands refuse to run while a Confluent Cloud or
-> Confluent Platform context is selected (`Error: you must log out of Confluent
-> Cloud to use this command`). `confluent logout` is **not** enough — it drops the
-> credential but leaves the context selected as `current_context`. Log out **and**
-> delete every context before proceeding (they only talk to CMF via
-> `$CONFLUENT_CMF_URL` regardless):
->
-> ```sh
-> confluent logout
-> confluent context list          # note the Name of each context
-> confluent context delete <name>  # repeat for every context listed
-> ```
+> ℹ️ `confluent flink` refuses to run while a Confluent Cloud/Platform context is
+> selected. `demo.sh` sidesteps this by running every `confluent` call with a
+> private config dir (`CONFLUENT_CLI_HOME`, default
+> `~/.cache/cpf-demo/confluent-home`), so your own CLI logins are never touched and
+> you don't need to log out or delete any contexts. Running `confluent flink ...`
+> by hand in your shell is still subject to the restriction.
 
 ## Quick start
 
@@ -63,7 +57,7 @@ in order; in particular, `up` has *already* started both of these port-forwards.
 ./demo.sh --gcp --user myusername up
 
 # Then, as needed:
-./demo.sh --gcp --user myusername cmf-ui         # open the CMF 2.4 web UI in a browser (http://localhost:8080/)
+./demo.sh --gcp --user myusername cmf-ui         # open the CMF 2.5 web UI in a browser (http://localhost:8080/)
 ./demo.sh --gcp --user myusername c3-ui          # open the Control Center (C3) web UI in a browser (http://localhost:9021/home)
 ./demo.sh --gcp --user myusername demo-pipeline  # run the demo pipeline: create tables, seed data, start the streaming job (prod)
 ./demo.sh --gcp --user myusername status         # check pod health and list Flink environments
@@ -77,7 +71,7 @@ in order; in particular, `up` has *already* started both of these port-forwards.
 ./demo.sh --aws --user myusername up
 
 # Then, as needed:
-./demo.sh --aws --user myusername cmf-ui         # open the CMF 2.4 web UI in a browser (http://localhost:8080/)
+./demo.sh --aws --user myusername cmf-ui         # open the CMF 2.5 web UI in a browser (http://localhost:8080/)
 ./demo.sh --aws --user myusername c3-ui          # open the Control Center (C3) web UI in a browser (http://localhost:9021/home)
 ./demo.sh --aws --user myusername demo-pipeline  # run the demo pipeline: create tables, seed data, start the streaming job (prod)
 ./demo.sh --aws --user myusername status         # check pod health and list Flink environments
@@ -96,7 +90,7 @@ Run `./demo.sh help` any time for the full subcommand list.
 > `:8080`) or `c3-forward` (Control Center, `:9021`) to restart it. `up` starts
 > both, but doesn't keep them alive.
 
-> The Artifact Storage introduced with CMF 2.4 is disabled by default.
+> The Artifact Storage introduced with CMF 2.5 is disabled by default.
 > See [Artifact storage](#artifact-storage-cmf-24) for details about enabling it.
 
 ## Configuration
@@ -121,10 +115,10 @@ AWS-specific defaults: `EKS_REGION` (`eu-central-1` — the shared account's
 `EKS_NODE_TYPE` (`m5.xlarge`). GCP-specific: `PROJECT`, `ZONE`
 (`europe-west1-b`), `NUM_NODES` (`3`), `MACHINE_TYPE` (`e2-standard-4`).
 
-### CMF 2.4 feature flags
+### CMF 2.5 feature flags
 
-`cmd_cmf` wires the CMF 2.4 opt-in features as helm `--set` flags, controlled
-from `config.sh` (each maps to an exact chart value path — CMF 2.4 validates the
+`cmd_cmf` wires the CMF 2.5 opt-in features as helm `--set` flags, controlled
+from `config.sh` (each maps to an exact chart value path — CMF 2.5 validates the
 values schema, so a wrong key fails the upgrade):
 
 | Env var | Default | Chart value |
@@ -140,7 +134,7 @@ The two self-contained features (`environmentCatalog`, `mcp`) default on so a
 fresh `cmf` run exercises 2.4; export the var as `false` to opt out. Managing
 Flink via Control Center is deprecated in 2.4 in favor of the built-in CMF UI.
 
-### Artifact storage (CMF 2.4)
+### Artifact storage (CMF 2.5)
 
 Artifact management (upload/version Flink JARs to blob storage, reference via
 `cmf://`) is **opt-in** and works on both clouds. Enable it with
@@ -225,7 +219,7 @@ Each is also runnable standalone (e.g. to re-run or resume a partial install):
 | 6 | `kafka` | Applies `cp/cp.yaml` (Kafka, Schema Registry, Control Center) |
 | 7 | `cert-manager` | Installs cert-manager (required by the Flink Kubernetes Operator) |
 | 8 | `flink-operator` | Creates `prod`/`test` namespaces, installs the Flink Kubernetes Operator |
-| 9 | `artifacts` | Provisions blob storage for CMF 2.4 artifacts: a per-user bucket + scoped static creds in a K8s secret. **Conditional** — only runs when `CMF_ARTIFACTS_ENABLED=true` |
+| 9 | `artifacts` | Provisions blob storage for CMF 2.5 artifacts: a per-user bucket + scoped static creds in a K8s secret. **Conditional** — only runs when `CMF_ARTIFACTS_ENABLED=true` |
 | 10 | `cmf` | Installs Confluent Manager for Apache Flink |
 | 11 | `cmf-forward` | Background port-forward `cmf-service` → `localhost:8080` (CMF UI/API) |
 | 12 | `c3-forward` | Background port-forward for Control Center → `localhost:9021` |
@@ -259,11 +253,11 @@ Run these yourself, as needed, after `up`:
 | `demo-pipeline [env] [pool]` | Runs the full stream-processing demo pipeline (default `prod`). By default every step runs on `shared-pool` (fast — no cold start); pass a pool name to force a different pool for all steps (e.g. `demo-pipeline prod pool` runs the data load on the DEDICATED `pool`, which confirms COMPLETED but is slower) |
 | `generate-data [env] [count] [pool]` | Inserts more random rows into `demo_events` on demand (default `prod`, `20` rows, `shared-pool`) |
 | `application [env] [file]` | Deploys a raw `FlinkApplication` (default `prod`, `app/cpf_basic_app.json`) |
-| `cmf-ui` | Ensures the CMF port-forward (same as step 11) and opens the CMF 2.4 web UI in a browser (root of `localhost:8080`, same port as the REST API) |
+| `cmf-ui` | Ensures the CMF port-forward (same as step 11) and opens the CMF 2.5 web UI in a browser (root of `localhost:8080`, same port as the REST API) |
 | `c3-ui` | Ensures the Control Center port-forward (same as step 12) and opens the C3 web UI in a browser (`http://localhost:9021/home`) |
 | `status` | Shows pod health, Flink environments, and port-forward status |
 | `stop-port-forward` | Stops all background port-forwards started by this script (both the CMF and Control Center forwards) |
-| `down [--yes]` | Stops port-forwards, deletes the GKE/EKS cluster. On AWS, PVCs are marked for deletion first, then their EBS volumes actually release as `eksctl` drains the nodegroup; a final check warns about any leftover volume |
+| `down [--yes]` | Stops port-forwards, deletes the GKE/EKS cluster. On AWS, PVCs are marked for deletion first, then their EBS volumes actually release as `eksctl` drains the nodegroup; a final check warns about any leftover volume. On GCP, the PD disks behind the cluster's PVs are recorded first and deleted after the cluster, since GKE otherwise orphans them |
 
 ## The demo pipeline
 
@@ -500,7 +494,7 @@ confluent flink environment list \
 | eksctl `up` fails with `would exceed the limit of N NAT gateways` | That region's per-AZ NAT-gateway quota is full (common on shared accounts) — retry in a different region, e.g. `EKS_REGION=<other-region> ./demo.sh --aws --user <name> up`. The default is `eu-central-1`; `eu-west-1` is known to be full on the shared account |
 | EKS pods stuck `Pending` with unbound PVCs (Kafka/SR/Control Center) | The EBS CSI driver/default `gp3` `StorageClass` didn't finish setting up — check `kubectl -n kube-system get pods -l app=ebs-csi-controller` and `kubectl get storageclass` (expect `gp3` marked `(default)`); re-run `./demo.sh --aws --user <name> cluster` to retry (idempotent) |
 | `aws`/`eksctl` commands fail with an auth error | Your assumed AWS profile expired or isn't set — re-run `export AWS_PROFILE=...` and confirm with `aws sts get-caller-identity` before retrying |
-| `demo.sh` dies with `ERROR: confluent CLI can't reach CMF` | A Confluent Cloud/Platform context is still selected — `confluent flink ...` refuses to run, and `confluent logout` alone doesn't clear it (it leaves the context as `current_context`). Log out **and** delete every context, then retry: `confluent logout`, then `confluent context list` (note each context Name) and `confluent context delete <name>` for every context listed. No re-login is needed — these commands reach CMF purely via `CONFLUENT_CMF_URL`/`--url` |
+| `demo.sh` dies with `ERROR: confluent CLI can't reach CMF` | The CMF port-forward isn't serving or CMF isn't Ready — check `kubectl -n confluent get pods` and `$CONFLUENT_CMF_URL`, then re-run (`demo.sh` uses an isolated CLI config, so your own Confluent contexts are not the cause). If you run `confluent flink ...` manually and get `you must log out of Confluent Cloud`, use `HOME=~/.cache/cpf-demo/confluent-home confluent flink ...` or delete your contexts |
 | `up` failed partway through creating resources | Fix the underlying problem and just re-run `up` — every step is idempotent, so it skips what already exists and continues. On the re-run the `check-quotas` step may now warn about a quota that was fine the first time (e.g. VPCs/Elastic IPs per region): that's expected, because the resources created by the first (partial) run already count against the quota. Answer `y` at the prompt to proceed — you're reusing those existing resources, not creating additional ones |
 
 ## Teardown
