@@ -28,6 +28,7 @@ spec:
       - confluent.telemetry.metrics.collector.interval.ms=60000
       - confluent.telemetry.remoteconfig._confluent.enabled=false
       - confluent.consumer.lag.emitter.enabled=true
+      # @@KAFKA_SECURITY_CONTROLLER@@
 ---
 apiVersion: platform.confluent.io/v1beta1
 kind: Kafka
@@ -77,6 +78,7 @@ spec:
       - controller.listener.names=CONTROLLER
       - listener.security.protocol.map=BROKER:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
       - inter.broker.listener.name=BROKER
+      # @@KAFKA_SECURITY_BROKER@@
 ---
 apiVersion: platform.confluent.io/v1beta1
 kind: SchemaRegistry
@@ -91,6 +93,7 @@ spec:
   dependencies:
     kafka:
       bootstrapEndpoint: kafka:9071
+      # @@KAFKA_SECURITY_SR@@
 ---
 apiVersion: platform.confluent.io/v1beta1
 kind: ControlCenter
@@ -112,6 +115,7 @@ spec:
       url: http://schemaregistry.confluent.svc.cluster.local:8081
     kafka:
       bootstrapEndpoint: kafka:9071
+      # @@KAFKA_SECURITY_C3@@
   services:
     prometheus:
        image: confluentinc/cp-enterprise-prometheus:${PROMETHEUS_VERSION}

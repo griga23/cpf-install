@@ -96,8 +96,7 @@ any other config change.
   statement resource gets stuck reporting a non-terminal phase forever
   instead of `COMPLETED`. Any new one-shot/bounded logic must go on the
   DEDICATED pool (or accept unverifiable completion, as `cmd_generate_data`
-  does when defaulting to `shared-pool` — see its `SHARED_INSERT_GRACE_SECONDS` sleep (default 30s — must exceed startup + one 10s checkpoint or the Kafka sink never commits) + grace-period
-  branch).
+  does when defaulting to `shared-pool` — see its `wait_for_shared_bounded_statement` — it polls for `COMPLETED` for up to `SHARED_INSERT_GRACE_SECONDS` (default 180s; a fixed sleep dropped the data when a cold-start TaskManager took longer) and only warns if it never arrives).
 - **`cmd_compute_pool` waits for `shared-pool` to reach `RUNNING`** before
   returning (`wait_for_compute_pool_phase`, up to 300s) — CMF rejects
   statement submissions to a SHARED pool that's still cold-starting
@@ -135,6 +134,38 @@ any other config change.
   each mapping to an exact chart value path — CMF 2.5 validates its values
   schema, so a wrong key fails the upgrade. See the README table before
   adding a new flag.
+- **CMF security is opt-in (`CMF_SECURITY_ENABLED=true`).** `cmd_cmf` then enables the
+  embedded MDS (file user store from the `mds-users` secret, JWT key pair in `mds-keypair`,
+  super user = first of `CMF_SECURITY_USERS`) and `cmf.authorization.authority=cmf`.
+  Gotchas: secret volumes need `defaultMode` 288 (0440) or CMF refuses to start ("password
+  file is world-readable"); its `mountedVolumes[...]` indices must come after the GCP
+  artifact key's `[0]` (helm `--set` replaces list entries by index, and `helm upgrade`
+  doesn't keep earlier values, so artifact env vars must be re-exported on every `cmf`
+  run); tokens come from `<cmf-url>/security/1.0/authenticate`. The `confluent()` wrapper
+  logs the script's private CLI home in as the super user (hourly marker file), and the one
+  direct REST call (`create_or_update_compute_pool` PUT) sends a bearer token.
+  `cmd_security` binds each other user to the environment of the same name
+  (`ClusterAdmin --flink-environment <u>` + `DeveloperRead --resource FlinkEnvironment:<u>`;
+  the CLI resource type is `FlinkEnvironment`, not `Environment`); `cmd_security_test` is
+  the PASS/FAIL matrix. macOS bash 3.2: no associative arrays (`sec_tok`/`sec_set_tok`).
+- **Kafka security is opt-in (`KAFKA_SECURITY_ENABLED=true`) and layered on `cp/cp.yaml` via
+  markers.** `cp.yaml` carries `# @@KAFKA_SECURITY_<X>@@` comment lines; `render_kafka_manifest`
+  pipes through `kafka_security_inject`, which (only when enabled) replaces them with SASL/PLAIN +
+  `StandardAuthorizer` config lines for the controller and broker `configOverrides` (the later
+  duplicate key wins, so they override the earlier plaintext `listener.security.protocol.map`)
+  and `dependencies.kafka.authentication` for SR/C3 (secrets `kafka-{sr,c3}-client`). The
+  controller listener needs SASL too (no network policies on this GKE cluster, so nothing can
+  be fenced off). Switching an existing cluster deadlocks CFK's staged controller roll;
+  `cmd_kafka` patches the StatefulSet `partition` to 0. `kafka_admin_exec` runs kafka CLI
+  snippets as the `kafka` super user over stdin (no secrets in argv). Each Flink env `<e>`
+  gets Kafka user `flink_<e>` with prefixed ACLs `<e>_` (+ literal `_confluent_sr_catalog`,
+  which CMF's catalog needs), and in CMF a Secret `<e>-kafka-secret`, catalog `<e>-cat`,
+  database `<e>-db` (`connectionSecretId: <e>-kafka-conn`) and an EnvironmentSecretMapping
+  created ONLY in env `<e>`; use `env_catalog`/`env_database`/`env_table_prefix`/`render_sql`
+  instead of `$CATALOG_NAME`/`$DATABASE_NAME`/bare table names in any new statement code.
+  `render_flink_storage` MERGES into an existing `podTemplate` (the Java app's Kafka-credential
+  env vars). Test traps: console producer/consumer exit 0 on authorization errors - judge by
+  output text and real topic contents; bash 3.2 has no `declare -A`.
 - **Port-forwards verify actual reachability, not just PID liveness.**
   `ensure_port_forward` (used by `cmd_cmf_forward`/`cmd_c3_forward`/every step
   that talks to CMF) checks `is_port_serving` — a real HTTP round trip, not

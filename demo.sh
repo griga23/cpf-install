@@ -13,6 +13,8 @@ source ./config.sh
 
 PORT_FORWARD_PID_FILE=".demo-cmf-port-forward.pid"
 C3_PORT_FORWARD_PID_FILE=".demo-c3-port-forward.pid"
+SECURITY_USERS_FILE=".demo-security-users"   # <user>=<password> lines, gitignored
+KAFKA_USERS_FILE=".demo-kafka-users"         # Kafka SASL <user>=<password> lines, gitignored
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -39,7 +41,25 @@ require_aws_identity() {
 # Only `confluent` gets the alternate HOME - gcloud/kubectl/helm keep the real one.
 confluent() {
   mkdir -p "$CONFLUENT_CLI_HOME"
+  confluent_login_admin_if_needed
   HOME="$CONFLUENT_CLI_HOME" command confluent "$@"
+}
+
+# With CMF security on, every CMF call needs a bearer token, so the script's own CLI home
+# is logged in (via `confluent login --url <cmf>`) as the super user. Tokens last 6h; a
+# marker file keeps this to one login per hour instead of one per CLI call (many calls run
+# in subshells, where a plain shell variable wouldn't carry over).
+confluent_login_admin_if_needed() {
+  [[ "$CMF_SECURITY_ENABLED" == "true" ]] || return 0
+  local marker="$CONFLUENT_CLI_HOME/.mds-login" super="${CMF_SECURITY_USERS%% *}"
+  [[ -n "$(find "$marker" -mmin -60 2>/dev/null)" ]] && return 0
+  if HOME="$CONFLUENT_CLI_HOME" CONFLUENT_PLATFORM_USERNAME="$super" \
+       CONFLUENT_PLATFORM_PASSWORD="$(security_password "$super")" \
+       command confluent login --url "$CONFLUENT_CMF_URL" >/dev/null 2>&1; then
+    touch "$marker"
+  else
+    warn "could not log the confluent CLI in to CMF as '$super' - is the CMF port-forward up and security enabled?"
+  fi
 }
 
 # Preflight for every CMF-talking subcommand: probes `confluent flink environment
@@ -66,6 +86,109 @@ wait_pods_ready() {
 # Substitutes the ${..._VERSION} placeholders in cp/cp.yaml with the
 # values from config.sh, so bumping a container version only requires editing
 # config.sh - no envsubst dependency, just sed.
+# ---------------------------------------------------------------------------
+# Kafka security demo (SASL/PLAIN + ACLs) - see KAFKA_SECURITY_ENABLED in config.sh
+# ---------------------------------------------------------------------------
+
+# Kafka user for a Flink environment (underscore: usable as a JAAS option name).
+kafka_env_user() { printf 'flink_%s' "$1"; }
+
+# Password of a Kafka SASL user, generated and persisted on first use.
+kafka_password() {
+  local user="$1" pw
+  touch "$KAFKA_USERS_FILE"; chmod 600 "$KAFKA_USERS_FILE"
+  pw=$(awk -F= -v u="$user" '$1==u{sub(/^[^=]*=/,""); print; exit}' "$KAFKA_USERS_FILE")
+  if [[ -z "$pw" ]]; then
+    pw=$(openssl rand -hex 8)
+    echo "${user}=${pw}" >> "$KAFKA_USERS_FILE"
+  fi
+  printf '%s' "$pw"
+}
+
+# All Kafka SASL users: the brokers' own identity, the platform components, one per Flink environment.
+kafka_all_users() {
+  local e; printf 'kafka sr c3'
+  for e in $FLINK_ENVIRONMENTS; do printf ' %s' "$(kafka_env_user "$e")"; done
+}
+
+# `user_<name>="<pw>" ...` entries of the broker-side PlainLoginModule.
+kafka_jaas_user_entries() {
+  local u out=""
+  for u in $(kafka_all_users); do out="${out} user_${u}=\"$(kafka_password "$u")\""; done
+  printf '%s' "${out# }"
+}
+
+# Text blocks injected into cp/cp.yaml at the @@KAFKA_SECURITY_*@@ markers (6-space list items).
+kafka_security_block() {
+  local plain="org.apache.kafka.common.security.plain.PlainLoginModule"
+  local kpw; kpw=$(kafka_password kafka)
+  case "$1" in
+    CONTROLLER)
+      cat <<EOF
+      - listener.security.protocol.map=CONTROLLER:SASL_PLAINTEXT,REPLICATION:PLAINTEXT
+      - sasl.enabled.mechanisms=PLAIN
+      - sasl.mechanism.controller.protocol=PLAIN
+      - listener.name.controller.plain.sasl.jaas.config=${plain} required user_kafka="${kpw}";
+      - authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      - super.users=User:kafka
+EOF
+      ;;
+    BROKER)
+      local entries; entries=$(kafka_jaas_user_entries)
+      cat <<EOF
+      - listener.security.protocol.map=BROKER:SASL_PLAINTEXT,EXTERNAL:SASL_PLAINTEXT,CONTROLLER:SASL_PLAINTEXT
+      - sasl.enabled.mechanisms=PLAIN
+      - sasl.mechanism.inter.broker.protocol=PLAIN
+      - sasl.mechanism.controller.protocol=PLAIN
+      - listener.name.broker.plain.sasl.jaas.config=${plain} required username="kafka" password="${kpw}" ${entries};
+      - listener.name.external.plain.sasl.jaas.config=${plain} required username="kafka" password="${kpw}" ${entries};
+      - listener.name.controller.plain.sasl.jaas.config=${plain} required username="kafka" password="${kpw}";
+      - authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      - super.users=User:kafka;User:sr;User:c3
+EOF
+      ;;
+    SR|C3)
+      local u; u=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+      cat <<EOF
+      authentication:
+        type: plain
+        jaasConfig:
+          secretRef: kafka-${u}-client
+EOF
+      ;;
+  esac
+}
+
+# Replaces each @@KAFKA_SECURITY_<X>@@ marker line with its block, when Kafka security is on
+# (the markers are plain YAML comments otherwise, so the manifest stays valid either way).
+kafka_security_inject() {
+  if [[ "$KAFKA_SECURITY_ENABLED" != "true" ]]; then cat; return 0; fi
+  require_cmds openssl awk
+  local d m; d=$(mktemp -d)
+  for m in CONTROLLER BROKER SR C3; do kafka_security_block "$m" > "$d/$m"; done
+  awk -v dir="$d" '
+    /@@KAFKA_SECURITY_[A-Z0-9]+@@/ {
+      m=$0; sub(/.*@@KAFKA_SECURITY_/,"",m); sub(/@@.*/,"",m)
+      f=dir "/" m
+      while ((getline line < f) > 0) print line
+      close(f); next
+    }
+    { print }'
+  rm -rf "$d"
+}
+
+# Client-credential secrets Schema Registry and Control Center read (plain.txt = username/password).
+ensure_kafka_client_secrets() {
+  local who
+  for who in sr c3; do
+    printf 'username=%s\npassword=%s\n' "$who" "$(kafka_password "$who")" > "/tmp/kafka-${who}-plain.txt.$$"
+    kubectl -n "$CONFLUENT_NAMESPACE" create secret generic "kafka-${who}-client" \
+      --from-file=plain.txt="/tmp/kafka-${who}-plain.txt.$$" --dry-run=client -o yaml \
+      | kubectl -n "$CONFLUENT_NAMESPACE" apply -f - >/dev/null
+    rm -f "/tmp/kafka-${who}-plain.txt.$$"
+  done
+}
+
 render_kafka_manifest() {
   sed \
     -e "s#\${CP_SERVER_VERSION}#${CP_SERVER_VERSION}#g" \
@@ -74,7 +197,7 @@ render_kafka_manifest() {
     -e "s#\${CONTROL_CENTER_VERSION}#${CONTROL_CENTER_VERSION}#g" \
     -e "s#\${PROMETHEUS_VERSION}#${PROMETHEUS_VERSION}#g" \
     -e "s#\${ALERTMANAGER_VERSION}#${ALERTMANAGER_VERSION}#g" \
-    "$1"
+    "$1" | kafka_security_inject
 }
 
 is_port_forward_alive() {
@@ -419,8 +542,63 @@ cmd_operator() {
 
 cmd_kafka() {
   log "Applying CP Kafka manifest (cp/cp.yaml, rendered with versions from config.sh)"
+  if [[ "$KAFKA_SECURITY_ENABLED" == "true" ]]; then
+    log "Kafka security: SASL/PLAIN + ACLs (users: $(kafka_all_users); passwords in $KAFKA_USERS_FILE)"
+    ensure_kafka_client_secrets
+  fi
   render_kafka_manifest cp/cp.yaml | kubectl apply -n "$CONFLUENT_NAMESPACE" -f -
+  if [[ "$KAFKA_SECURITY_ENABLED" == "true" ]]; then
+    # Switching an EXISTING cluster to SASL deadlocks CFK's staged roll: it won't restart the
+    # controller until it can query it, but the (already updated) broker can't register with
+    # the still-plaintext controller. This is a single-controller demo, so just let the
+    # StatefulSet update the controller right away. Harmless on a fresh install.
+    kubectl -n "$CONFLUENT_NAMESPACE" patch sts kraftcontroller --type merge \
+      -p '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":0}}}}' >/dev/null 2>&1 || true
+  fi
   wait_pods_ready "$CONFLUENT_NAMESPACE" 600s
+}
+
+require_kafka_security_enabled() {
+  [[ "$KAFKA_SECURITY_ENABLED" == "true" ]] \
+    || die "Kafka security is off - run with KAFKA_SECURITY_ENABLED=true (see config.sh)"
+}
+
+# Runs a snippet of kafka CLI commands inside kafka-0 as the `kafka` super user. The snippet
+# (and the admin client config with the password) goes over stdin, so no secret lands in a
+# process argument list; the config file is removed again on exit. $A = base kafka-acls call.
+kafka_admin_exec() {
+  local snippet="$1"
+  {
+    printf 'set -e\ncat > /tmp/admin.properties <<CFG\nsecurity.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\n'
+    printf 'sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="kafka" password="%s";\nCFG\n' "$(kafka_password kafka)"
+    printf 'trap "rm -f /tmp/admin.properties" EXIT\nB=localhost:9071\nC=/tmp/admin.properties\n'
+    printf '%s\n' "$snippet"
+  } | kubectl -n "$CONFLUENT_NAMESPACE" exec -i kafka-0 -c kafka -- bash -s
+}
+
+# ACLs: each Flink environment's Kafka user gets full control of topics starting with
+# "<env>_" and nothing else on topics. Groups / transactional ids are not data, so those are
+# open to the Flink users (needed for consumer offsets and exactly-once sinks); cluster
+# Describe + IdempotentWrite are what producers need. CMF's Kafka catalog also keeps table
+# metadata in the shared internal topic _confluent_sr_catalog, which every environment's user
+# needs (see README: it is the one place metadata of all environments meets). Safe to re-run.
+cmd_kafka_acls() {
+  require_kafka_security_enabled
+  require_cmds openssl
+  local e u snippet=""
+  for e in $FLINK_ENVIRONMENTS; do
+    u=$(kafka_env_user "$e")
+    log "ACLs for Kafka user '$u': topics '${e}_*' only"
+    snippet+="kafka-acls --bootstrap-server \$B --command-config \$C --force --add --allow-principal User:${u} --operation All --topic ${e}_ --resource-pattern-type prefixed
+kafka-acls --bootstrap-server \$B --command-config \$C --force --add --allow-principal User:${u} --operation All --group '*'
+kafka-acls --bootstrap-server \$B --command-config \$C --force --add --allow-principal User:${u} --operation All --transactional-id '*'
+kafka-acls --bootstrap-server \$B --command-config \$C --force --add --allow-principal User:${u} --operation Describe --operation IdempotentWrite --cluster
+kafka-acls --bootstrap-server \$B --command-config \$C --force --add --allow-principal User:${u} --operation Read --operation Write --operation Describe --operation DescribeConfigs --operation Create --topic _confluent_sr_catalog
+"
+  done
+  kafka_admin_exec "$snippet" >/dev/null
+  log "Kafka ACLs now:"
+  kafka_admin_exec 'kafka-acls --bootstrap-server $B --command-config $C --list' | grep -E "principal|ResourcePattern" | sed 's/^/  /' | head -40
 }
 
 cmd_c3_forward() {
@@ -653,7 +831,18 @@ render_flink_storage() {
        else
          { spec: { containers: [ ({name:"flink-main-container"} + $container) ] } }
        end) as $podTemplate
-    | setpath($p; $spec + {podTemplate: $podTemplate})
+    # MERGE into any podTemplate the spec already has (e.g. Kafka credential env vars) instead
+    # of replacing it: our env/volumeMounts are appended to flink-main-container, volumes appended.
+    | ($spec.podTemplate // {}) as $pt
+    | (($pt.spec.containers // []) | map(select(.name != "flink-main-container"))) as $others
+    | ((($pt.spec.containers // []) | map(select(.name == "flink-main-container")) | first) // {name:"flink-main-container"}) as $main
+    | ($main
+        | .env = ((.env // []) + ($podTemplate.spec.containers[0].env // []))
+        | (if ($podTemplate.spec.containers[0].volumeMounts // []) | length > 0
+           then .volumeMounts = ((.volumeMounts // []) + $podTemplate.spec.containers[0].volumeMounts) else . end)) as $newmain
+    | (($pt.spec.volumes // []) + ($podTemplate.spec.volumes // [])) as $vols
+    | setpath($p; $spec + {podTemplate: ($pt * {spec: ({containers: ($others + [$newmain])}
+                                                      + (if ($vols | length) > 0 then {volumes: $vols} else {} end))})})
   '
 }
 
@@ -670,6 +859,49 @@ render_spec_to_tmp() {
   out="${d}/$(basename "$file")"
   render_flink_storage "$spec_path" < "$file" > "$out"
   printf '%s' "$out"
+}
+
+# ---------------------------------------------------------------------------
+# CMF security demo (embedded MDS + RBAC) - see CMF_SECURITY_ENABLED in config.sh
+# ---------------------------------------------------------------------------
+
+# Prints a demo user's password, generating and persisting one on first use.
+security_password() {
+  local user="$1" pw
+  touch "$SECURITY_USERS_FILE"; chmod 600 "$SECURITY_USERS_FILE"
+  pw=$(awk -F= -v u="$user" '$1==u{sub(/^[^=]*=/,""); print; exit}' "$SECURITY_USERS_FILE")
+  if [[ -z "$pw" ]]; then
+    pw=$(openssl rand -hex 8)
+    echo "${user}=${pw}" >> "$SECURITY_USERS_FILE"
+  fi
+  printf '%s' "$pw"
+}
+
+# Creates the two secrets the embedded MDS mounts: the JWT signing key pair (only once -
+# regenerating it would invalidate every issued token) and users.properties (re-applied
+# every time so user/password changes take effect on the next `cmf` run).
+ensure_security_secrets() {
+  require_cmds openssl kubectl
+  ensure_namespace "$CONFLUENT_NAMESPACE"
+  local d u
+  d=$(mktemp -d)
+  if ! kubectl -n "$CONFLUENT_NAMESPACE" get secret "$SECURITY_KEYPAIR_SECRET" >/dev/null 2>&1; then
+    log "Generating MDS token key pair -> secret '$SECURITY_KEYPAIR_SECRET'"
+    openssl genrsa -out "$d/tokenKeypair.pem" 2048 2>/dev/null
+    openssl rsa -in "$d/tokenKeypair.pem" -outform PEM -pubout -out "$d/tokenPublicKey.pem" 2>/dev/null
+    kubectl -n "$CONFLUENT_NAMESPACE" create secret generic "$SECURITY_KEYPAIR_SECRET" \
+      --from-file=tokenKeypair.pem="$d/tokenKeypair.pem" \
+      --from-file=tokenPublicKey.pem="$d/tokenPublicKey.pem" >/dev/null
+  fi
+  : > "$d/users.properties"
+  for u in $CMF_SECURITY_USERS; do
+    echo "${u}: $(security_password "$u"),${u}-group" >> "$d/users.properties"
+  done
+  log "Applying user store secret '$SECURITY_USERS_SECRET' for: $CMF_SECURITY_USERS (passwords in $SECURITY_USERS_FILE)"
+  kubectl -n "$CONFLUENT_NAMESPACE" create secret generic "$SECURITY_USERS_SECRET" \
+    --from-file=users.properties="$d/users.properties" --dry-run=client -o yaml \
+    | kubectl -n "$CONFLUENT_NAMESPACE" apply -f - >/dev/null
+  rm -rf "$d"
 }
 
 cmd_cmf() {
@@ -740,12 +972,339 @@ cmd_cmf() {
         ;;
     esac
   fi
+  # Authentication + RBAC through CMF's embedded MDS (opt-in). Mount indices must come
+  # after any mountedVolumes entries the artifact wiring above already added (GCP uses
+  # volumes[0]/volumeMounts[0] for its key), since --set replaces list entries by index.
+  if [[ "$CMF_SECURITY_ENABLED" == "true" ]]; then
+    ensure_security_secrets
+    local mv=0 super="${CMF_SECURITY_USERS%% *}"
+    [[ "$CMF_ARTIFACTS_ENABLED" == "true" && "$CLOUD" == "gcp" ]] && mv=1
+    local mv2=$((mv + 1))
+    set_args+=(
+      --set cmf.mds.enabled=true
+      --set cmf.mds.port="$CMF_MDS_PORT"
+      --set cmf.mds.authentication-method=BEARER
+      --set-string cmf.mds.token-key-path=/mnt/secrets/mds/tokenKeypair.pem
+      --set-string cmf.mds.public-key-path=/mnt/secrets/mds/tokenPublicKey.pem
+      --set cmf.mds.user-store=FILE
+      --set-string cmf.mds.user-store-file-path=/mnt/secrets/mds-users/users.properties
+      --set-string "cmf.mds.super-users=User:${super}"
+      --set cmf.authentication.type=oauth
+      --set-string 'cmf.authentication.config.public\.key\.path=/mnt/secrets/mds/tokenPublicKey.pem'
+      --set-string "cmf.authentication.config.confluent\.metadata\.bootstrap\.server\.urls=http://localhost:${CMF_MDS_PORT}"
+      --set cmf.authorization.authority=cmf
+      --set-string "cmf.kafka.oauthbearerAllowedUrls=http://localhost:${CMF_MDS_PORT}"
+      --set cmf.ui.auth.basicAuthEnabled=true
+      --set cmf.ui.auth.ssoEnabled=false
+      --set "mountedVolumes.volumes[${mv}].name=mds-keypair"
+      --set "mountedVolumes.volumes[${mv}].secret.secretName=${SECURITY_KEYPAIR_SECRET}"
+      # CMF refuses a world-readable password file (k8s secret volumes default to 0644).
+      # 288 = 0440 - helm --set can't take an octal literal. Applied to the key pair too.
+      --set "mountedVolumes.volumes[${mv}].secret.defaultMode=288"
+      --set "mountedVolumes.volumes[${mv2}].name=mds-users"
+      --set "mountedVolumes.volumes[${mv2}].secret.secretName=${SECURITY_USERS_SECRET}"
+      --set "mountedVolumes.volumes[${mv2}].secret.defaultMode=288"
+      --set "mountedVolumes.volumeMounts[${mv}].name=mds-keypair"
+      --set-string "mountedVolumes.volumeMounts[${mv}].mountPath=/mnt/secrets/mds"
+      --set "mountedVolumes.volumeMounts[${mv}].readOnly=true"
+      --set "mountedVolumes.volumeMounts[${mv2}].name=mds-users"
+      --set-string "mountedVolumes.volumeMounts[${mv2}].mountPath=/mnt/secrets/mds-users"
+      --set "mountedVolumes.volumeMounts[${mv2}].readOnly=true"
+    )
+    log "CMF security: embedded MDS + RBAC enabled (super user: $super; users: $CMF_SECURITY_USERS)"
+  fi
   log "CMF feature flags: environmentCatalog=$CMF_ENVIRONMENT_CATALOG_ENABLED mcp=$CMF_MCP_ENABLED (writeTools=$CMF_MCP_WRITE_TOOLS_ENABLED) artifacts=$CMF_ARTIFACTS_ENABLED"
   helm upgrade --install cmf confluentinc/confluent-manager-for-apache-flink \
     --version "$CMF_VERSION" \
     "${set_args[@]}" \
     --namespace "$CONFLUENT_NAMESPACE"
   wait_pods_ready "$CONFLUENT_NAMESPACE" 180s
+}
+
+# Prints a bearer token for a demo user (empty on failure). Tokens come from the embedded
+# MDS, which is reachable on the CMF URL itself under /security/1.0/.
+cmf_token() {
+  curl -s -m 10 -u "$1:$(security_password "$1")" "${CONFLUENT_CMF_URL}/security/1.0/authenticate" 2>/dev/null \
+    | jq -r '.auth_token // empty' 2>/dev/null || true
+}
+
+# Logs a user into the embedded MDS with the CLI, in a per-user config dir (so it can't
+# disturb the script's own CLI home). Needed for `confluent iam rbac ...`.
+security_cli_login() {
+  local user="$1" home="${CONFLUENT_CLI_HOME}/iam-$1"
+  mkdir -p "$home"
+  HOME="$home" CONFLUENT_PLATFORM_USERNAME="$user" CONFLUENT_PLATFORM_PASSWORD="$(security_password "$user")" \
+    command confluent login --url "$CONFLUENT_CMF_URL" >/dev/null 2>&1 \
+    || die "CLI login to CMF as '$user' failed - is security enabled (CMF_SECURITY_ENABLED=true ... cmf) and the port-forward up?"
+}
+
+require_security_enabled() {
+  [[ "$CMF_SECURITY_ENABLED" == "true" ]] \
+    || die "CMF security is off - run with CMF_SECURITY_ENABLED=true (see config.sh), e.g. CMF_SECURITY_ENABLED=true ./demo.sh --gcp --user <you> cmf"
+  require_cmds curl jq confluent
+}
+
+# Creates the role bindings: the first user in CMF_SECURITY_USERS is the super user (set via
+# helm, no binding needed). Every other user <u> is bound to the Flink environment of the
+# same name: ClusterAdmin scoped to that environment (full control of its statements,
+# applications, compute pools, artifacts) plus DeveloperRead on the FlinkEnvironment
+# resource itself (so the environment shows up in listings). Nothing is granted on any
+# other environment or at CMF-cluster scope. Safe to re-run.
+cmd_security() {
+  require_security_enabled
+  ensure_cmf_port_forward
+  local super="${CMF_SECURITY_USERS%% *}" u cid
+  security_cli_login "$super"
+  cid=$(curl -s -m 10 -H "Authorization: Bearer $(cmf_token "$super")" "${CONFLUENT_CMF_URL}/security/1.0/metadataClusterId")
+  [[ -n "$cid" ]] || die "could not read the CMF cluster id - is security enabled on the running CMF?"
+  log "CMF cluster id: $cid  (super user: $super)"
+  for u in ${CMF_SECURITY_USERS#"$super"}; do
+    log "Binding user '$u' to Flink environment '$u'"
+    HOME="${CONFLUENT_CLI_HOME}/iam-$super" command confluent iam rbac role-binding create \
+      --principal "User:$u" --role ClusterAdmin --cmf "$cid" --flink-environment "$u" >/dev/null \
+      || warn "ClusterAdmin binding for '$u' on environment '$u' failed (does the environment exist?)"
+    HOME="${CONFLUENT_CLI_HOME}/iam-$super" command confluent iam rbac role-binding create \
+      --principal "User:$u" --role DeveloperRead --cmf "$cid" --resource "FlinkEnvironment:$u" >/dev/null \
+      || warn "DeveloperRead binding for '$u' on FlinkEnvironment:$u failed"
+    if [[ "$KAFKA_SECURITY_ENABLED" == "true" ]]; then
+      # Each user also gets to SEE (not edit) its own catalog; the other environment's catalog
+      # and every CMF secret stay invisible to it.
+      HOME="${CONFLUENT_CLI_HOME}/iam-$super" command confluent iam rbac role-binding create \
+        --principal "User:$u" --role DeveloperRead --cmf "$cid" --resource "FlinkCatalog:$(env_catalog "$u")" >/dev/null \
+        || warn "DeveloperRead binding for '$u' on FlinkCatalog:$(env_catalog "$u") failed"
+    fi
+  done
+  log "Role bindings:"
+  for u in ${CMF_SECURITY_USERS#"$super"}; do
+    echo "  $u: ClusterAdmin on environment '$u' + DeveloperRead on FlinkEnvironment '$u'$([[ "$KAFKA_SECURITY_ENABLED" == "true" ]] && echo " + FlinkCatalog '$(env_catalog "$u")'")"
+  done
+  echo "  $super: super user (all environments)"
+  log "Credentials (user=password) are in $SECURITY_USERS_FILE; log in with: confluent login --url $CONFLUENT_CMF_URL"
+}
+
+# --- security-test helpers ---------------------------------------------------
+SEC_PASS=0; SEC_FAIL=0
+sec_check() {  # <description> <expected> <actual>
+  if [[ "$2" == "$3" ]]; then
+    SEC_PASS=$((SEC_PASS + 1)); printf '  \033[1;32mPASS\033[0m  %s\n' "$1"
+  else
+    SEC_FAIL=$((SEC_FAIL + 1)); printf '  \033[1;31mFAIL\033[0m  %s (expected %s, got %s)\n' "$1" "$2" "$3"
+  fi
+}
+# HTTP status class: CMF answers a denied request with 401 or 403 depending on the path.
+sec_class() { case "$1" in 200|201|204) echo allowed ;; 401|403) echo denied ;; *) echo "http-$1" ;; esac; }
+# <token> <method> <path> [json-body] -> prints the status code, body in $SEC_BODY_FILE
+sec_http() {
+  local tok="$1" method="$2" path="$3" body="${4:-}"
+  local args=(-s -m 20 -X "$method" -o "$SEC_BODY_FILE" -w '%{http_code}')
+  [[ -n "$tok" ]] && args+=(-H "Authorization: Bearer $tok")
+  [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' -d "$body")
+  curl "${args[@]}" "${CONFLUENT_CMF_URL}/cmf/api/v1/${path}" 2>/dev/null || echo 000
+}
+
+# bash 3.2 (macOS) has no associative arrays: keep each user's token in SEC_TOK_<user>.
+sec_set_tok() { printf -v "SEC_TOK_$1" '%s' "$2"; }
+sec_tok() { local v="SEC_TOK_$1"; printf '%s' "${!v:-}"; }
+
+# --- Kafka security checks (only when KAFKA_SECURITY_ENABLED=true) -----------------------------
+sec_kv() { grep "^$1=" "$SEC_KV_FILE" | head -1 | cut -d= -f2-; }   # value of key $1 from the remote output
+
+# CMF side: each user sees only its own catalog, and never any secret (they hold Kafka passwords).
+sec_test_catalogs() {
+  local u e t names want
+  log "Catalogs and secrets (CMF RBAC)"
+  for u in $CMF_SECURITY_USERS; do
+    t=$(sec_tok "$u"); [[ -n "$t" ]] || continue
+    sec_http_raw "$t" GET catalogs/kafka >/dev/null
+    names=$(jq -r '[.items[]?.metadata.name] | sort | join(",")' "$SEC_BODY_FILE")
+    if [[ "$u" == "${CMF_SECURITY_USERS%% *}" ]]; then want=$(for e in $FLINK_ENVIRONMENTS; do env_catalog "$e"; echo; done | sort | paste -sd, -); else want=$(env_catalog "$u"); fi
+    sec_check "'$u' sees catalogs [$want]" "$want" "$names"
+    sec_http_raw "$t" GET secrets >/dev/null
+    names=$(jq -r '[.items[]?.metadata.name] | join(",")' "$SEC_BODY_FILE")
+    if [[ "$u" == "${CMF_SECURITY_USERS%% *}" ]]; then want=$(for e in $FLINK_ENVIRONMENTS; do echo "${e}-kafka-secret"; done | sort | paste -sd, -); names=$(printf '%s' "$names" | tr ',' '\n' | sort | paste -sd, -); else want=""; fi
+    sec_check "'$u' sees secrets [${want:-none}]" "$want" "$names"
+    if [[ "$u" != "${CMF_SECURITY_USERS%% *}" ]]; then
+      for e in $FLINK_ENVIRONMENTS; do
+        code=$(sec_http_raw "$t" GET "secrets/${e}-kafka-secret"); sec_check "'$u' reads secret '${e}-kafka-secret'" denied "$(sec_class "$code")"
+        want=denied; [[ "$e" == "$u" ]] && want=allowed
+        code=$(sec_http_raw "$t" GET "catalogs/kafka/$(env_catalog "$e")"); sec_check "'$u' reads catalog '$(env_catalog "$e")'" "$want" "$(sec_class "$code")"
+      done
+    fi
+  done
+}
+# GET/POST against the CMF API root (not /cmf/api/v1) for catalogs/secrets paths.
+sec_http_raw() { sec_http "$@"; }
+
+# Kafka side, with each environment's own SASL credentials, run inside kafka-0 in one session.
+# For every user u and topic prefix t: create / produce / consume / list. A message from each
+# user is written to every prefix's probe topic, and a super-user scan afterwards proves only
+# the legitimate ones landed (the console tools exit 0 on errors, so results are read from
+# their output and from the topics' real contents).
+sec_test_kafka() {
+  local e u t d script
+  log "Kafka ACLs (per-environment SASL users, topic prefixes)"
+  SEC_KV_FILE=$(mktemp)
+  script=$(
+    printf 'cd /tmp\n'
+    for u in kafka $(for e in $FLINK_ENVIRONMENTS; do printf "%s " "$(kafka_env_user "$e")"; done); do
+      printf "cat > /tmp/sec-%s.p <<'CFG'\nsecurity.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"%s\" password=\"%s\";\nCFG\n" "$u" "$u" "$(kafka_password "$u")"
+    done
+    printf "trap 'rm -f /tmp/sec-*.p' EXIT\nB=localhost:9071\nT=\"%s\"\n" "$FLINK_ENVIRONMENTS"
+    cat <<'REMOTE'
+K="kafka-topics --bootstrap-server $B --command-config /tmp/sec-kafka.p"
+for t in $T; do
+  $K --create --if-not-exists --topic ${t}_secprobe --partitions 1 --replication-factor 1 >/dev/null 2>&1
+  echo "seed-$t" | kafka-console-producer --bootstrap-server $B --producer.config /tmp/sec-kafka.p --topic ${t}_secprobe >/dev/null 2>&1
+done
+for u in $T; do
+  f=/tmp/sec-flink_$u.p
+  for t in $T; do
+    out=$(kafka-topics --bootstrap-server $B --command-config $f --create --topic ${t}_secnew_$u --partitions 1 --replication-factor 1 2>&1)
+    echo "create.$u.$t=$(echo "$out" | grep -qi 'authoriz' && echo denied || echo allowed)"
+    out=$(echo "msg-$u" | kafka-console-producer --bootstrap-server $B --producer.config $f --topic ${t}_secprobe 2>&1)
+    echo "produce.$u.$t=$(echo "$out" | grep -qiE 'AUTHORIZATION_FAILED|not authorized' && echo denied || echo allowed)"
+    out=$(kafka-console-consumer --bootstrap-server $B --consumer.config $f --topic ${t}_secprobe --from-beginning --max-messages 1 --timeout-ms 12000 2>&1)
+    if echo "$out" | grep -qiE 'authoriz'; then r=denied; elif echo "$out" | grep -q "^seed-$t$"; then r=allowed; else r=nodata; fi
+    echo "consume.$u.$t=$r"
+  done
+  echo "list.$u=$(kafka-topics --bootstrap-server $B --command-config $f --list 2>/dev/null | grep -v '^_' | sed 's/_.*//' | sort -u | paste -sd, -)"
+done
+sleep 2
+for t in $T; do
+  echo "content.$t=$(kafka-console-consumer --bootstrap-server $B --consumer.config /tmp/sec-kafka.p --topic ${t}_secprobe --from-beginning --timeout-ms 8000 2>/dev/null | grep -v '^Option' | tr '\n' ' ' | sed 's/ *$//')"
+done
+echo "unauth=$(timeout 30 kafka-topics --bootstrap-server $B --list >/dev/null 2>&1 && echo allowed || echo denied)"
+printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="flink_%s" password="wrong";\n' "${T%% *}" > /tmp/sec-bad.p
+echo "badpw=$(timeout 30 kafka-topics --bootstrap-server $B --command-config /tmp/sec-bad.p --list >/dev/null 2>&1 && echo allowed || echo denied)"
+for tp in $($K --list 2>/dev/null | grep -E '_sec(probe|new_)'); do $K --delete --topic $tp >/dev/null 2>&1; done
+REMOTE
+  )
+  printf '%s\n' "$script" | kubectl -n "$CONFLUENT_NAMESPACE" exec -i kafka-0 -c kafka -- bash -s 2>/dev/null | grep -E '^[a-z]+(\.[a-z_]+)*=' > "$SEC_KV_FILE" || true
+  sec_check "no credentials is rejected by the brokers" denied "$(sec_kv unauth)"
+  sec_check "wrong password is rejected by the brokers" denied "$(sec_kv badpw)"
+  for u in $FLINK_ENVIRONMENTS; do
+    for t in $FLINK_ENVIRONMENTS; do
+      want=denied; [[ "$u" == "$t" ]] && want=allowed
+      sec_check "Kafka user flink_$u creates topic ${t}_*"   "$want" "$(sec_kv create.$u.$t)"
+      sec_check "Kafka user flink_$u writes to ${t}_*"       "$want" "$(sec_kv produce.$u.$t)"
+      sec_check "Kafka user flink_$u reads from ${t}_*"      "$want" "$(sec_kv consume.$u.$t)"
+    done
+    sec_check "Kafka user flink_$u sees only topic prefix [$u]" "$u" "$(sec_kv list.$u)"
+  done
+  for t in $FLINK_ENVIRONMENTS; do
+    sec_check "topic ${t}_* holds only its own environment's messages (ground truth)" "seed-$t msg-$t" "$(sec_kv content.$t)"
+  done
+  rm -f "$SEC_KV_FILE"
+}
+
+# SQL side: real statements submitted by each logged-in CMF user through the CLI.
+sec_sql() {  # <user> <environment> <catalog> <database> <sql> -> allowed | denied
+  local user="$1" env="$2" cat="$3" db="$4" sql="$5" name phase i
+  local home="${CONFLUENT_CLI_HOME}/iam-${user}"
+  name="sectest-$RANDOM"
+  if ! HOME="$home" command confluent --environment "$env" flink statement create "$name" --catalog "$cat" --database "$db" \
+        --compute-pool "$SHARED_COMPUTE_POOL_NAME" --parallelism 1 --sql "$sql" >/dev/null 2>&1; then
+    echo denied; return 0
+  fi
+  for i in $(seq 1 30); do
+    phase=$(HOME="$home" command confluent --environment "$env" flink statement describe "$name" -o json 2>/dev/null | jq -r '.status.phase // "UNKNOWN"')
+    case "$phase" in COMPLETED|FAILED|STOPPED) break ;; esac
+    sleep 3
+  done
+  HOME="$home" command confluent --environment "$env" flink statement delete "$name" --force >/dev/null 2>&1 || true
+  [[ "$phase" == "COMPLETED" ]] && echo allowed || echo denied
+}
+
+sec_test_sql() {
+  local u o
+  log "Flink SQL as each user (CMF RBAC + catalog mapping + Kafka ACLs together)"
+  for u in $FLINK_ENVIRONMENTS; do
+    security_cli_login "$u"
+    sec_check "'$u' runs CREATE TABLE ${u}_sectest in $(env_catalog "$u")" allowed \
+      "$(sec_sql "$u" "$u" "$(env_catalog "$u")" "$(env_database "$u")" "CREATE TABLE IF NOT EXISTS ${u}_sectest (id STRING) DISTRIBUTED INTO 1 BUCKETS")"
+    sec_sql "$u" "$u" "$(env_catalog "$u")" "$(env_database "$u")" "DROP TABLE IF EXISTS ${u}_sectest" >/dev/null
+    for o in $FLINK_ENVIRONMENTS; do
+      [[ "$o" == "$u" ]] && continue
+      sec_check "'$u' runs CREATE TABLE ${o}_sectest (other environment's prefix)" denied \
+        "$(sec_sql "$u" "$u" "$(env_catalog "$u")" "$(env_database "$u")" "CREATE TABLE IF NOT EXISTS ${o}_sectest (id STRING) DISTRIBUTED INTO 1 BUCKETS")"
+      sec_check "'$u' uses catalog '$(env_catalog "$o")' from environment '$u'" denied \
+        "$(sec_sql "$u" "$u" "$(env_catalog "$o")" "$(env_database "$o")" "SHOW TABLES")"
+      sec_check "'$u' submits SQL into environment '$o'" denied \
+        "$(sec_sql "$u" "$o" "$(env_catalog "$o")" "$(env_database "$o")" "SHOW TABLES")"
+    done
+  done
+}
+
+# End-to-end test of the security setup: authentication, then for every user x environment
+# whether it can see (list/get), count and write resources - each result compared with what
+# the role bindings should allow. Uses harmless probes (a DEDICATED compute pool definition
+# and a throwaway environment, both deleted again). Exits non-zero on any failure.
+cmd_security_test() {
+  require_security_enabled
+  ensure_cmf_port_forward
+  SEC_PASS=0; SEC_FAIL=0
+  SEC_BODY_FILE=$(mktemp)
+  local super="${CMF_SECURITY_USERS%% *}" u e t code want n_ref n_got names expected
+  local pool_body
+  pool_body=$(jq '.metadata.name="sec-probe"' "$COMPUTE_POOL_FILE" 2>/dev/null) \
+    || die "cannot read compute pool template $COMPUTE_POOL_FILE"
+
+  log "Authentication"
+  code=$(sec_http "" GET environments);                       sec_check "no token is rejected" denied "$(sec_class "$code")"
+  code=$(sec_http "not-a-real-token" GET environments);       sec_check "garbage bearer token is rejected" denied "$(sec_class "$code")"
+  code=$(curl -s -m 10 -u "$super:wrong-password" -o /dev/null -w '%{http_code}' "${CONFLUENT_CMF_URL}/security/1.0/authenticate")
+  sec_check "wrong password is rejected" denied "$(sec_class "$code")"
+  for u in $CMF_SECURITY_USERS; do
+    sec_set_tok "$u" "$(cmf_token "$u")"
+    sec_check "user '$u' can log in (token issued)" yes "$([[ -n "$(sec_tok "$u")" ]] && echo yes || echo no)"
+  done
+
+  for u in $CMF_SECURITY_USERS; do
+    [[ -n "$(sec_tok "$u")" ]] || continue
+    log "Authorization as '$u'$([[ "$u" == "$super" ]] && echo ' (super user: everything)' || echo " (should only reach environment '$u')")"
+    # What does the environment list show?
+    sec_http "$(sec_tok "$u")" GET environments >/dev/null
+    names=$(jq -r '[.items[]?.name] | sort | join(",")' "$SEC_BODY_FILE")
+    if [[ "$u" == "$super" ]]; then expected=$(printf '%s\n' $FLINK_ENVIRONMENTS | sort | paste -sd, -); else expected="$u"; fi
+    sec_check "environment list shows [$expected]" "$expected" "$names"
+    for e in $FLINK_ENVIRONMENTS; do
+      want=denied; [[ "$u" == "$super" || "$u" == "$e" ]] && want=allowed
+      code=$(sec_http "$(sec_tok "$u")" GET "environments/$e");  sec_check "GET environment '$e'" "$want" "$(sec_class "$code")"
+      # Resource visibility: compare how many compute pools the user sees with the admin's view.
+      sec_http "$(sec_tok "$super")" GET "environments/$e/compute-pools" >/dev/null; n_ref=$(jq '[.items[]?]|length' "$SEC_BODY_FILE")
+      sec_http "$(sec_tok "$u")" GET "environments/$e/compute-pools" >/dev/null;    n_got=$(jq '[.items[]?]|length' "$SEC_BODY_FILE")
+      [[ "$want" == denied ]] && n_ref=0
+      sec_check "compute pools visible in '$e'" "$n_ref" "$n_got"
+      sec_http "$(sec_tok "$super")" GET "environments/$e/statements" >/dev/null; n_ref=$(jq '[.items[]?]|length' "$SEC_BODY_FILE")
+      sec_http "$(sec_tok "$u")" GET "environments/$e/statements" >/dev/null;    n_got=$(jq '[.items[]?]|length' "$SEC_BODY_FILE")
+      [[ "$want" == denied ]] && n_ref=0
+      sec_check "statements visible in '$e'" "$n_ref" "$n_got"
+      # Write: create a compute pool definition, then remove it (as the super user, so a
+      # leftover from an unexpected success is cleaned up too).
+      code=$(sec_http "$(sec_tok "$u")" POST "environments/$e/compute-pools" "$pool_body")
+      sec_check "create compute pool in '$e'" "$want" "$(sec_class "$code")"
+      sec_http "$(sec_tok "$super")" DELETE "environments/$e/compute-pools/sec-probe" >/dev/null
+    done
+    # Cluster-scope write: only the super user may create/delete environments.
+    want=denied; [[ "$u" == "$super" ]] && want=allowed
+    code=$(sec_http "$(sec_tok "$u")" POST environments '{"name":"sec-tmp","kubernetesNamespace":"default"}')
+    sec_check "create a new environment (cluster scope)" "$want" "$(sec_class "$code")"
+    sec_http "$(sec_tok "$super")" DELETE environments/sec-tmp >/dev/null
+  done
+
+  if [[ "$KAFKA_SECURITY_ENABLED" == "true" ]]; then
+    sec_test_catalogs
+    sec_test_kafka
+    sec_test_sql
+  fi
+
+  rm -f "$SEC_BODY_FILE"
+  echo
+  if (( SEC_FAIL == 0 )); then
+    log "Security test: all $SEC_PASS checks passed"
+  else
+    die "Security test: $SEC_FAIL of $((SEC_PASS + SEC_FAIL)) checks FAILED"
+  fi
 }
 
 cmd_cmf_forward() {
@@ -779,10 +1338,65 @@ cmd_flink_environments() {
   confluent flink environment list
 }
 
+# Per-environment names when Kafka security is on (one catalog/database per Flink
+# environment, tables/topics prefixed "<env>_"); the single shared defaults otherwise.
+env_catalog()      { if [[ "$KAFKA_SECURITY_ENABLED" == "true" ]]; then printf '%s-cat' "$1"; else printf '%s' "$CATALOG_NAME"; fi; }
+env_database()     { if [[ "$KAFKA_SECURITY_ENABLED" == "true" ]]; then printf '%s-db' "$1"; else printf '%s' "$DATABASE_NAME"; fi; }
+env_table_prefix() { if [[ "$KAFKA_SECURITY_ENABLED" == "true" ]]; then printf '%s_' "$1"; fi; }
+
+# The demo SQL files use the bare table names demo_events / demo_aggregated; in Kafka security
+# mode every table (= Kafka topic) must start with the environment's prefix, so rewrite them.
+render_sql() {
+  local p; p=$(env_table_prefix "$2")
+  sed -e "s/demo_events/${p}demo_events/g" -e "s/demo_aggregated/${p}demo_aggregated/g" "$1"
+}
+
+# Kafka security mode: for every Flink environment <e> create
+#   secret          <e>-kafka-secret   the environment's Kafka SASL credentials (user flink_<e>)
+#   catalog         <e>-cat            + database <e>-db (DDL allowed only from <e>), whose Kafka
+#                                      connection refers to the placeholder <e>-kafka-conn
+#   secret mapping  <e>-kafka-conn     created ONLY in environment <e>, linking the placeholder
+#                                      to that secret
+# CMF merges the mapped secret into the database's connection config, and an environment with
+# no mapping for a catalog can't use it at all - so each environment sees only its own
+# catalog and connects to Kafka as its own user (whose ACLs cover only <e>_* topics).
+cmd_catalog_per_env() {
+  require_cmds confluent jq openssl
+  local env user d jaas
+  d=$(mktemp -d)
+  for env in $FLINK_ENVIRONMENTS; do
+    user=$(kafka_env_user "$env")
+    jaas="org.apache.kafka.common.security.plain.PlainLoginModule required username=\"${user}\" password=\"$(kafka_password "$user")\";"
+    log "Environment '$env': secret '${env}-kafka-secret' (Kafka user $user), catalog '$(env_catalog "$env")', database '$(env_database "$env")'"
+    jq -n --arg n "${env}-kafka-secret" --arg jaas "$jaas" \
+      '{apiVersion:"cmf.confluent.io/v1",kind:"Secret",metadata:{name:$n},
+        spec:{data:{"security.protocol":"SASL_PLAINTEXT","sasl.mechanism":"PLAIN","sasl.jaas.config":$jaas}}}' > "$d/secret.json"
+    confluent flink secret create "$d/secret.json" >/dev/null 2>&1 \
+      || confluent flink secret update "$d/secret.json" >/dev/null \
+      || warn "could not create or update secret '${env}-kafka-secret'"
+    jq --arg n "$(env_catalog "$env")" '.metadata.name=$n' "$CATALOG_FILE" > "$d/catalog.json"
+    confluent flink catalog create "$d/catalog.json" >/dev/null 2>&1 || warn "catalog '$(env_catalog "$env")' may already exist"
+    jq --arg n "$(env_database "$env")" --arg id "${env}-kafka-conn" --arg e "$env" \
+      '.metadata.name=$n | .spec.kafkaCluster.connectionSecretId=$id | .spec.ddlEnvironments=[$e]' "$DATABASE_FILE" > "$d/database.json"
+    if ! confluent flink catalog database create "$d/database.json" --catalog "$(env_catalog "$env")" >/dev/null 2>&1; then
+      confluent flink catalog database update "$d/database.json" --catalog "$(env_catalog "$env")" >/dev/null 2>&1 \
+        || warn "could not create or update database '$(env_database "$env")'"
+    fi
+    jq -n --arg id "${env}-kafka-conn" --arg s "${env}-kafka-secret" \
+      '{apiVersion:"cmf.confluent.io/v1",kind:"EnvironmentSecretMapping",metadata:{name:$id},spec:{secretName:$s}}' > "$d/mapping.json"
+    confluent flink secret-mapping create "$d/mapping.json" --environment "$env" >/dev/null 2>&1 \
+      || confluent flink secret-mapping update "$d/mapping.json" --environment "$env" >/dev/null \
+      || warn "could not create or update the secret mapping in environment '$env'"
+  done
+  rm -rf "$d"
+  confluent flink catalog list
+}
+
 cmd_catalog() {
   require_cmds confluent
   ensure_cmf_port_forward
   require_cmf_access
+  if [[ "$KAFKA_SECURITY_ENABLED" == "true" ]]; then cmd_catalog_per_env; return 0; fi
   log "Creating Kafka catalog '$CATALOG_NAME' from $CATALOG_FILE"
   confluent flink catalog create "$CATALOG_FILE" || warn "catalog may already exist"
   log "Creating database '$DATABASE_NAME' from $DATABASE_FILE (DDL permissions for: $FLINK_ENVIRONMENTS)"
@@ -807,7 +1421,9 @@ create_or_update_compute_pool() {
   # Check existence first so the create-vs-update branch (and its message) is accurate.
   if confluent flink compute-pool describe --environment "$env" "$name" >/dev/null 2>&1; then
     # Exists -> update via REST (the CLI has no `compute-pool update`).
-    if curl -sf -X PUT -H "Content-Type: application/json" -d "@${rendered}" \
+    local auth_hdr=()
+    [[ "$CMF_SECURITY_ENABLED" == "true" ]] && auth_hdr=(-H "Authorization: Bearer $(cmf_token "${CMF_SECURITY_USERS%% *}")")
+    if curl -sf -X PUT -H "Content-Type: application/json" "${auth_hdr[@]}" -d "@${rendered}" \
         "${CONFLUENT_CMF_URL}/cmf/api/v1/environments/${env}/compute-pools/${name}" >/dev/null; then
       log "Compute pool '$name' already existed in '$env' - updated it to match $file"
     else
@@ -872,6 +1488,21 @@ wait_for_statement_phase() {
   done
 }
 
+# Waits for a bounded statement on a SHARED pool. Historically these never left a
+# non-terminal phase (so callers had to guess with a sleep), but on current CMF/operator
+# versions they do reach COMPLETED - so poll for it, up to SHARED_INSERT_GRACE_SECONDS,
+# which must cover a cold start (the first job on a fresh pool waits for a TaskManager
+# pod) plus one 10s checkpoint, since deleting the statement before the Kafka sink
+# commits silently drops the data. If COMPLETED never shows up, fall back to the old
+# behaviour: warn and carry on. Prints the last phase seen; always returns 0.
+wait_for_shared_bounded_statement() {
+  local env="$1" name="$2" phase
+  phase=$(wait_for_statement_phase "$env" "$name" "$SHARED_INSERT_GRACE_SECONDS" COMPLETED) || true
+  [[ "$phase" == "COMPLETED" ]] \
+    || warn "statement '$name' on a SHARED pool still reports '$phase' after ${SHARED_INSERT_GRACE_SECONDS}s - assuming it finished, but verify the data landed"
+  return 0
+}
+
 # Polls a compute pool's phase until it matches one of the given "ok" phases
 # (success), FAILED (failure), or the timeout elapses. Prints the final phase seen.
 # Mirrors wait_for_statement_phase: CMF rejects statement submissions to a SHARED
@@ -899,11 +1530,11 @@ run_pipeline_statement() {
   [[ -f "$sql_file" ]] || die "SQL file not found: $sql_file"
   delete_statement_quiet "$env" "$name"
   confluent --environment "$env" flink statement create "$name" \
-    --catalog "$CATALOG_NAME" \
-    --database "$DATABASE_NAME" \
+    --catalog "$(env_catalog "$env")" \
+    --database "$(env_database "$env")" \
     --compute-pool "$pool" \
     --parallelism 1 \
-    --sql "$(cat "$sql_file")" >/dev/null
+    --sql "$(render_sql "$sql_file" "$env")" >/dev/null
   wait_for_statement_phase "$env" "$name" "$timeout" "$@"
 }
 
@@ -944,19 +1575,14 @@ cmd_demo_pipeline() {
   log "Inserting demo data into 'demo_events' in '$env' (compute pool: $insert_pool, type: $insert_pool_type)"
   delete_statement_quiet "$env" insert-demo-data
   confluent --environment "$env" flink statement create insert-demo-data \
-    --catalog "$CATALOG_NAME" \
-    --database "$DATABASE_NAME" \
+    --catalog "$(env_catalog "$env")" \
+    --database "$(env_database "$env")" \
     --compute-pool "$insert_pool" \
     --parallelism 1 \
-    --sql "$(cat "$INSERT_DEMO_DATA_SQL_FILE")" >/dev/null
+    --sql "$(render_sql "$INSERT_DEMO_DATA_SQL_FILE" "$env")" >/dev/null
   if [[ "$insert_pool_type" == "SHARED" ]]; then
-    # The Kafka sink only commits its transaction on a checkpoint (10s interval in the
-    # shared pool) AFTER job startup, so deleting the statement any sooner cancels the
-    # load before a single record is committed (seen: demo_events left empty with a 10s
-    # grace). Tunable via SHARED_INSERT_GRACE_SECONDS in config.sh.
-    sleep "$SHARED_INSERT_GRACE_SECONDS"
+    wait_for_shared_bounded_statement "$env" insert-demo-data
     delete_statement_quiet "$env" insert-demo-data
-    warn "insert ran on SHARED pool '$insert_pool' - completion isn't verifiable, but should already be done"
     log "Observe statements in the CMF or C3 UI: Flink Environment > $env > Statements"
   else
     phase=$(wait_for_statement_phase "$env" insert-demo-data 150 COMPLETED) || true
@@ -971,11 +1597,11 @@ cmd_demo_pipeline() {
   fi
   [[ -f "$STREAMING_SQL_FILE" ]] || die "SQL file not found: $STREAMING_SQL_FILE"
   confluent --environment "$env" flink statement create "$STATEMENT_NAME" \
-    --catalog "$CATALOG_NAME" \
-    --database "$DATABASE_NAME" \
+    --catalog "$(env_catalog "$env")" \
+    --database "$(env_database "$env")" \
     --compute-pool "$ddl_pool" \
     --parallelism 1 \
-    --sql "$(cat "$STREAMING_SQL_FILE")" >/dev/null
+    --sql "$(render_sql "$STREAMING_SQL_FILE" "$env")" >/dev/null
   phase=$(wait_for_statement_phase "$env" "$STATEMENT_NAME" 60 RUNNING) || true
   [[ "$phase" == "RUNNING" ]] || warn "statement '$STATEMENT_NAME' not RUNNING yet (phase=$phase) - check with ./demo.sh status"
 }
@@ -1001,7 +1627,7 @@ cmd_generate_data() {
   suffix=$(date +%s)
   tmpfile=$(mktemp)
   {
-    echo "INSERT INTO demo_events"
+    echo "INSERT INTO $(env_table_prefix "$env")demo_events"
     echo "/*+ OPTIONS('properties.transaction.timeout.ms'='300000') */"
     echo "VALUES"
     for ((i = 0; i < count; i++)); do
@@ -1019,22 +1645,18 @@ cmd_generate_data() {
   log "Generating $count demo events in '$env' (compute pool: $pool, type: $pool_type)"
   delete_statement_quiet "$env" "$name"
   confluent --environment "$env" flink statement create "$name" \
-    --catalog "$CATALOG_NAME" \
-    --database "$DATABASE_NAME" \
+    --catalog "$(env_catalog "$env")" \
+    --database "$(env_database "$env")" \
     --compute-pool "$pool" \
     --parallelism 1 \
     --sql "$(cat "$tmpfile")" >/dev/null
   rm -f "$tmpfile"
 
   if [[ "$pool_type" == "SHARED" ]]; then
-    # Bounded jobs on a SHARED pool actually finish in a couple of seconds,
-    # but the statement gets stuck reporting RECONCILING/PENDING forever
-    # instead of COMPLETED (operator quirk - see README troubleshooting), so
-    # there's no reliable phase to poll for. Give it a grace period (longer than
-    # startup + one 10s checkpoint, or the sink never commits) and move on.
-    sleep "$SHARED_INSERT_GRACE_SECONDS"
+    # See wait_for_shared_bounded_statement: poll for COMPLETED instead of guessing.
+    wait_for_shared_bounded_statement "$env" "$name"
     delete_statement_quiet "$env" "$name"
-    log "Requested $count new events into 'demo_events' in '$env' (SHARED pool - completion isn't verifiable, but should already be done)"
+    log "Requested $count new events into 'demo_events' in '$env' (SHARED pool)"
   else
     phase=$(wait_for_statement_phase "$env" "$name" 150 COMPLETED) || true
     delete_statement_quiet "$env" "$name"
@@ -1049,8 +1671,8 @@ run_verify_statement() {
   echo
   echo "--- $sql (environment: $env, compute pool: $SHARED_COMPUTE_POOL_NAME) ---"
   confluent --environment "$env" flink statement create "$name" \
-    --catalog "$CATALOG_NAME" \
-    --database "$DATABASE_NAME" \
+    --catalog "$(env_catalog "$env")" \
+    --database "$(env_database "$env")" \
     --compute-pool "$SHARED_COMPUTE_POOL_NAME" \
     --parallelism 1 \
     --sql "$sql" >/dev/null
@@ -1071,7 +1693,7 @@ cmd_verify() {
   ensure_cmf_port_forward
   require_cmf_access
   local env="${1:-prod}"
-  local probe_table="__verify_probe"
+  local probe_table; probe_table="$(env_table_prefix "$env")__verify_probe"
   log "Running startup verification statements in environment '$env'"
   run_verify_statement "$env" verify-show-tables "SHOW TABLES;"
   # Uses its own disposable table rather than depending on any pre-existing
@@ -1097,6 +1719,64 @@ cmd_application() {
   confluent flink application create "$rendered" --environment "$env" \
     || warn "application may already exist in '$env'"
   if [[ "$rendered" != "$file" ]]; then rm -rf "$(dirname "$rendered")"; fi
+}
+
+# Creates a Kafka topic as the super user (topic auto-creation is off on this cluster).
+kafka_ensure_topic() {
+  local topic="$1" create="kafka-topics --bootstrap-server \$B --create --if-not-exists --topic $1 --partitions 1 --replication-factor 1"
+  if [[ "$KAFKA_SECURITY_ENABLED" == "true" ]]; then
+    kafka_admin_exec "${create} --command-config \$C" >/dev/null
+  else
+    kubectl -n "$CONFLUENT_NAMESPACE" exec kafka-0 -c kafka -- bash -c "B=localhost:9071; ${create}" >/dev/null
+  fi
+}
+
+# Deploys the custom Java job (app/kafka-demo-job: Kafka demo_events -> per-category totals ->
+# Kafka <prefix>java_category_totals) as a FlinkApplication from a cmf:// artifact. Per
+# environment it: builds the JAR if needed, uploads it as an artifact, creates the sink topic,
+# (with Kafka security) puts the environment's Kafka credentials in a k8s secret the pod reads
+# as env vars, and deploys. Needs CMF_ARTIFACTS_ENABLED=true.
+cmd_java_app() {
+  require_cmds confluent jq kubectl
+  [[ "$CMF_ARTIFACTS_ENABLED" == "true" ]] \
+    || die "the Java demo app is deployed from a cmf:// artifact - run with CMF_ARTIFACTS_ENABLED=true (and CMF_ARTIFACTS_BASE_PATH on the cmf step)"
+  ensure_cmf_port_forward
+  require_cmf_access
+  local env="${1:-prod}" p jar sink user spec d
+  p=$(env_table_prefix "$env")
+  jar="$JAVA_DEMO_APP_DIR/target/kafka-demo-job-1.0.jar"
+  if [[ ! -f "$jar" ]]; then
+    require_cmds mvn java
+    log "Building $JAVA_DEMO_APP_DIR (mvn package)"
+    (cd "$JAVA_DEMO_APP_DIR" && mvn -q -B package -DskipTests) || die "maven build failed"
+  fi
+  if confluent flink artifact describe "$JAVA_DEMO_JAR_NAME" --environment "$env" >/dev/null 2>&1; then
+    log "Artifact '$JAVA_DEMO_JAR_NAME' already uploaded to environment '$env'"
+  else
+    log "Uploading artifact '$JAVA_DEMO_JAR_NAME' to environment '$env'"
+    confluent flink artifact create "$JAVA_DEMO_JAR_NAME" --artifact-file "$jar" --environment "$env" >/dev/null \
+      || die "artifact upload failed"
+  fi
+  sink="${p}java_category_totals"
+  log "Ensuring sink topic '$sink'"
+  kafka_ensure_topic "$sink"
+  d=$(mktemp -d); spec="$d/kafka-demo-job.json"
+  jq --arg env "$env" --arg src "${p}demo_events" --arg sink "$sink" --arg jar "$JAVA_DEMO_JAR_NAME" '
+      .spec.job.jarURI = "cmf://\($env)/\($jar)?version=1"
+      | .spec.job.args = ["--source-topic", $src, "--sink-topic", $sink]' "$JAVA_DEMO_APP_FILE" > "$spec"
+  if [[ "$KAFKA_SECURITY_ENABLED" == "true" ]]; then
+    user=$(kafka_env_user "$env")
+    log "Kafka credentials for '$user' -> secret kafka-client-creds in namespace '$env'"
+    printf 'username=%s\npassword=%s\n' "$user" "$(kafka_password "$user")" > "$d/creds.env"
+    kubectl -n "$env" create secret generic kafka-client-creds --from-env-file="$d/creds.env" \
+      --dry-run=client -o yaml | kubectl -n "$env" apply -f - >/dev/null
+    jq '.spec.podTemplate = {spec:{containers:[{name:"flink-main-container", env:[
+          {name:"KAFKA_USERNAME", valueFrom:{secretKeyRef:{name:"kafka-client-creds", key:"username"}}},
+          {name:"KAFKA_PASSWORD", valueFrom:{secretKeyRef:{name:"kafka-client-creds", key:"password"}}}]}]}}' "$spec" > "$spec.tmp" \
+      && mv "$spec.tmp" "$spec"
+  fi
+  cmd_application "$env" "$spec"
+  rm -rf "$d"
 }
 
 cmd_status() {
@@ -1126,6 +1806,7 @@ cmd_up() {
   cmd_namespace
   cmd_operator
   cmd_kafka
+  if [[ "$KAFKA_SECURITY_ENABLED" == "true" ]]; then cmd_kafka_acls; fi
   cmd_cert_manager
   cmd_flink_operator
   if [[ "$CMF_ARTIFACTS_ENABLED" == "true" ]]; then cmd_artifacts; fi
@@ -1134,6 +1815,7 @@ cmd_up() {
   cmd_c3_forward
   cmd_flink_environments
   cmd_catalog
+  if [[ "$CMF_SECURITY_ENABLED" == "true" ]]; then cmd_security; fi
   cmd_compute_pool
   for env in $FLINK_ENVIRONMENTS; do
     cmd_verify "$env"
@@ -1386,6 +2068,17 @@ Standalone commands (not run by `up`):
                           pass e.g. "pool" as 3rd arg to use the DEDICATED
                           pool instead, which is slower but confirms COMPLETED)
   application [env] [file] Deploy a simple FlinkApplication (default env: prod, default file: app/cpf_basic_app.json)
+  kafka-acls              Create the prefixed Kafka ACLs (needs KAFKA_SECURITY_ENABLED=true on the
+                          `kafka` step): each Flink environment's user only gets <env>_* topics
+  security                Create the RBAC role bindings for the demo users (needs
+                          CMF_SECURITY_ENABLED=true on the `cmf` step): the first user in
+                          CMF_SECURITY_USERS is the super user, every other user is bound to
+                          the Flink environment of the same name only
+  security-test           Run the end-to-end security test (authentication + per-user/
+                          per-environment read and write access), PASS/FAIL per check
+  java-app [env]          Deploy the custom Java job (app/kafka-demo-job) in an environment: uploads
+                          the JAR as a cmf:// artifact, creates its sink topic (+ Kafka credentials
+                          with KAFKA_SECURITY_ENABLED) and starts it (needs CMF_ARTIFACTS_ENABLED=true)
   cmf-ui                  Ensure the CMF port-forward (same as step 11) and open the CMF 2.5
                           web UI in a browser (root of :8080, same port as the REST API)
   c3-ui                   Ensure the Control Center port-forward (same as step 12) and open
@@ -1491,6 +2184,9 @@ case "$sub" in
   cmf) cmd_cmf "$@" ;;
   artifacts) cmd_artifacts "$@" ;;
   cmf-forward) cmd_cmf_forward "$@" ;;
+  security) cmd_security "$@" ;;
+  kafka-acls) cmd_kafka_acls "$@" ;;
+  security-test) cmd_security_test "$@" ;;
   stop-port-forward) cmd_stop_port_forward "$@" ;;
   flink-environments) cmd_flink_environments "$@" ;;
   catalog) cmd_catalog "$@" ;;
@@ -1499,6 +2195,7 @@ case "$sub" in
   generate-data) cmd_generate_data "$@" ;;
   verify) cmd_verify "$@" ;;
   application) cmd_application "$@" ;;
+  java-app) cmd_java_app "$@" ;;
   status) cmd_status "$@" ;;
   help|-h|--help) cmd_help ;;
   *) die "unknown subcommand '$sub' (see ./demo.sh help)" ;;

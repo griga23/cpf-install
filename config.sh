@@ -115,6 +115,36 @@ export CONFLUENT_CMF_URL
 : "${GENERATE_DATA_ROW_COUNT:=20}"         # default rows for ./demo.sh generate-data
 : "${GENERATE_DATA_MAX_OFFSET_SECONDS:=90}" # spread new rows over the last N seconds
 
-# Seconds to let the bounded demo-data INSERT run on a SHARED pool before deleting it.
-# Must exceed job startup + one checkpoint interval (10s), or nothing gets committed.
-: "${SHARED_INSERT_GRACE_SECONDS:=30}"
+# Max seconds to wait for a bounded demo-data INSERT on a SHARED pool to reach COMPLETED
+# before giving up and continuing. Must cover a cold start (first job on a fresh pool
+# waits for a TaskManager pod) + one 10s checkpoint, or the data is silently dropped.
+: "${SHARED_INSERT_GRACE_SECONDS:=180}"
+
+# --- CMF security demo (opt-in): authentication + RBAC via CMF's embedded MDS ---
+# When true, `cmf` enables the embedded MDS (file-based user store, JWT/OAuth bearer
+# tokens) and MDS-backed RBAC (cmf.authorization.authority=cmf). Every CMF API call then
+# needs a bearer token. The first user in CMF_SECURITY_USERS is the super user (full
+# access); the `security` subcommand creates role bindings so each other user only sees
+# the Flink environment of the same name. Passwords are generated on first use and kept in
+# the gitignored .demo-security-users file. NOTE: with this on, `confluent flink ...`
+# commands (and thus most of demo.sh's CMF steps) are not authenticated - see README.
+: "${CMF_SECURITY_ENABLED:=false}"
+: "${CMF_SECURITY_USERS:=admin prod test}"      # space separated; first = super user; others must match a Flink environment name
+: "${CMF_MDS_PORT:=8090}"                        # cmf.mds.port (embedded MDS listener inside the CMF pod)
+: "${SECURITY_KEYPAIR_SECRET:=mds-keypair}"      # k8s secret holding the MDS token signing key pair
+: "${SECURITY_USERS_SECRET:=mds-users}"          # k8s secret holding users.properties
+
+# --- Kafka security demo (opt-in): SASL/PLAIN + ACLs, one topic prefix per Flink environment ---
+# When true, the brokers (and the KRaft controller) require SASL/PLAIN on every listener and
+# enforce ACLs. Schema Registry / Control Center / the brokers themselves are super users.
+# Each Flink environment <env> in FLINK_ENVIRONMENTS gets its own Kafka user `flink_<env>`
+# that may only touch topics starting with "<env>_" (prefixed ACLs), and its own CMF catalog
+# `<env>-cat` / database `<env>-db` whose Kafka credentials are mapped ONLY into that
+# environment (CMF secrets + secret mappings). Tables are therefore named <env>_demo_events
+# etc. Passwords are generated into the gitignored .demo-kafka-users file.
+: "${KAFKA_SECURITY_ENABLED:=false}"
+
+# --- Custom Java demo job (java-app subcommand) ---
+: "${JAVA_DEMO_APP_DIR:=app/kafka-demo-job}"          # Maven project (mvn package -> target/kafka-demo-job-1.0.jar)
+: "${JAVA_DEMO_APP_FILE:=app/kafka-demo-job.json}"    # FlinkApplication template (jarURI/args are set per environment)
+: "${JAVA_DEMO_JAR_NAME:=kafka-demo-job.jar}"         # artifact name in CMF
