@@ -7,6 +7,10 @@ data → continuous windowed aggregation). Every subcommand requires picking a
 cloud via `--gcp` or `--aws` **and** a `--user <name>` (see below) — the rest
 of the pipeline (Kafka, CMF, Flink, the SQL demo) is identical on both.
 
+Architecture and security diagrams (CMF components on Kubernetes, users and role
+bindings, how a Flink application gets its Kafka credentials) are in
+[docs/demo-environment.md](docs/demo-environment.md).
+
 ## Prerequisites
 
 Common to both clouds:
@@ -134,6 +138,104 @@ The two self-contained features (`environmentCatalog`, `mcp`) default on so a
 fresh `cmf` run exercises 2.4; export the var as `false` to opt out. Managing
 Flink via Control Center is deprecated in 2.4 in favor of the built-in CMF UI.
 
+### Security demo: users, authentication and RBAC (opt-in)
+
+`CMF_SECURITY_ENABLED=true` turns on CMF's **embedded MDS** with a file-based user store
+and MDS-backed RBAC (`cmf.authorization.authority=cmf`), so every CMF call needs a
+bearer token and every user only sees what their role bindings allow. Three users are
+created (`CMF_SECURITY_USERS`, default `admin prod test`):
+
+| User | Access |
+|---|---|
+| `admin` | Super user: everything, all environments |
+| `prod` | Only the `prod` Flink environment (statements, applications, compute pools, artifacts) |
+| `test` | Only the `test` Flink environment |
+
+Passwords are generated on first use and stored in the gitignored `.demo-security-users`
+file (`user=password` per line).
+
+```sh
+export CMF_SECURITY_ENABLED=true            # (plus CMF_ARTIFACTS_ENABLED / CMF_ARTIFACTS_BASE_PATH if you use artifacts - helm replaces, not merges, values)
+./demo.sh --gcp --user myusername cmf        # upgrade CMF with the embedded MDS + RBAC
+./demo.sh --gcp --user myusername security   # create the role bindings (idempotent)
+./demo.sh --gcp --user myusername security-test   # PASS/FAIL matrix, exits non-zero on any failure
+```
+
+Each non-admin user gets `ClusterAdmin` scoped to the environment of the same name (full
+control inside it, nothing elsewhere) plus `DeveloperRead` on that `FlinkEnvironment`
+resource so it shows up in listings. To demo as a user:
+
+```sh
+confluent login --url http://localhost:8080                  # username/password from .demo-security-users
+confluent flink environment list                             # prod user sees only: prod
+confluent flink statement list --environment test            # prod user: nothing / 401
+```
+
+The CMF web UI (http://localhost:8080/) also asks for a username and password. `demo.sh`
+itself logs its private CLI home in as `admin`, so its own steps keep working. Notes:
+
+- Only **CMF** is secured. Kafka, Schema Registry and the catalog are shared and
+  unauthenticated, and Control Center is not supported with the embedded MDS (use the CMF UI).
+- Denied requests answer `401` (some paths `403`); list endpoints return an *empty* list
+  rather than an error for resources the user can't see.
+- Role bindings are stored in CMF's database. Turning security off again (re-run `cmf`
+  without the flag) removes the login requirement but keeps the bindings.
+- Secret volumes are mounted `0440`: CMF refuses a world-readable password file.
+
+### Security demo, part 2: Kafka authentication, ACLs and per-environment topic prefixes (opt-in)
+
+`KAFKA_SECURITY_ENABLED=true` secures the Kafka cluster itself and ties each Flink
+environment to its own topic prefix, so the CMF users from the section above can't reach
+each other's *data* either:
+
+| | `prod` environment | `test` environment |
+|---|---|---|
+| Kafka user (SASL/PLAIN) | `flink_prod` | `flink_test` |
+| Topics it may use (prefixed ACLs) | `prod_*` | `test_*` |
+| CMF catalog / database | `prod-cat` / `prod-db` | `test-cat` / `test-db` |
+| CMF secret → mapping (only in that environment) | `prod-kafka-secret` → `prod-kafka-conn` | `test-kafka-secret` → `test-kafka-conn` |
+| Demo tables / topics | `prod_demo_events`, `prod_demo_aggregated`, `prod_java_category_totals` | `test_demo_events`, `test_demo_aggregated`, `test_java_category_totals` |
+
+How it fits together: the brokers and the KRaft controller require SASL/PLAIN on every
+listener and enforce ACLs (Schema Registry, Control Center and the brokers are super users).
+CMF stores each environment's Kafka credentials in a *secret*; the catalog's database refers
+to it through a placeholder id that is mapped to the secret **only inside that environment**.
+An environment can therefore only use its own catalog (others are rejected as "unknown
+catalog"), connects to Kafka as its own user, and can only create, read and write topics
+starting with its prefix. Passwords are generated into the gitignored `.demo-kafka-users`.
+
+```sh
+export KAFKA_SECURITY_ENABLED=true CMF_SECURITY_ENABLED=true     # (+ the artifact vars if you use them)
+./demo.sh --gcp --user myusername up                  # a fresh install does everything below
+# on an existing cluster, step by step:
+./demo.sh --gcp --user myusername kafka               # SASL + ACL authorizer on Kafka, SR and C3 (restarts them)
+./demo.sh --gcp --user myusername kafka-acls          # prefixed ACLs per environment user
+./demo.sh --gcp --user myusername catalog             # per-environment secrets, catalogs, databases, mappings
+./demo.sh --gcp --user myusername security            # CMF role bindings (now incl. each user's own catalog)
+./demo.sh --gcp --user myusername demo-pipeline prod  # SQL demo on prod_* topics (repeat for test)
+./demo.sh --gcp --user myusername java-app prod       # custom Java job (needs CMF_ARTIFACTS_ENABLED=true)
+./demo.sh --gcp --user myusername security-test       # full PASS/FAIL matrix (76 checks)
+```
+
+`security-test` covers, with real credentials: CMF authentication and RBAC, catalog and
+secret visibility, Kafka create/produce/consume/list for every user × prefix (plus a
+ground-truth scan that each topic holds only its own environment's messages), and Flink SQL
+run by each logged-in user (own prefix works; the other prefix, the other catalog and the
+other environment are refused).
+
+Known limits (it is a demo, not a hardened setup):
+
+- SASL/PLAIN over **plaintext** (no TLS); passwords also sit in the Kafka/KRaft custom
+  resources (`configOverrides`) and, unless CMF's database encryption is enabled, unencrypted
+  in CMF secrets (the API never returns them).
+- **Schema Registry is open**: any environment can read the schemas (subject names and
+  fields, not records) of the other's tables.
+- CMF's catalog keeps table metadata for *all* environments in one internal topic,
+  `_confluent_sr_catalog`, which both environment users need and can read.
+- Consumer groups and transactional ids are not isolated (they carry no record data).
+- Switching an *existing* cluster to SASL deadlocks the operator's staged controller restart;
+  `kafka` works around it (single controller, so safe). A fresh install is unaffected.
+
 ### Artifact storage (CMF 2.5)
 
 Artifact management (upload/version Flink JARs to blob storage, reference via
@@ -217,6 +319,7 @@ Each is also runnable standalone (e.g. to re-run or resume a partial install):
 | 4 | `namespace` | Creates the `confluent` namespace, sets it as default context |
 | 5 | `operator` | Installs the `confluent-for-kubernetes` operator |
 | 6 | `kafka` | Applies `cp/cp.yaml` (Kafka, Schema Registry, Control Center) |
+| 6b | `kafka-acls` | **Conditional** — only when `KAFKA_SECURITY_ENABLED=true`: creates the prefixed Kafka ACLs (`<env>_*` per environment user) |
 | 7 | `cert-manager` | Installs cert-manager (required by the Flink Kubernetes Operator) |
 | 8 | `flink-operator` | Creates `prod`/`test` namespaces, installs the Flink Kubernetes Operator |
 | 9 | `artifacts` | Provisions blob storage for CMF 2.5 artifacts: a per-user bucket + scoped static creds in a K8s secret. **Conditional** — only runs when `CMF_ARTIFACTS_ENABLED=true` |
@@ -224,7 +327,8 @@ Each is also runnable standalone (e.g. to re-run or resume a partial install):
 | 11 | `cmf-forward` | Background port-forward `cmf-service` → `localhost:8080` (CMF UI/API) |
 | 12 | `c3-forward` | Background port-forward for Control Center → `localhost:9021` |
 | 13 | `flink-environments` | Creates the `prod`/`test` CMF environments |
-| 14 | `catalog` | Creates/updates the `kafka-cat` catalog and `kafka-db` database, with DDL permissions |
+| 14 | `catalog` | Creates/updates the `kafka-cat` catalog and `kafka-db` database, with DDL permissions. With `KAFKA_SECURITY_ENABLED=true`: one secret, catalog, database and environment-scoped secret mapping per Flink environment instead |
+| 14b | `security` | **Conditional** — only when `CMF_SECURITY_ENABLED=true`: creates the CMF RBAC role bindings |
 | 15 | `compute-pool` | Creates/updates the `pool` (DEDICATED) and `shared-pool` (SHARED) compute pools, and waits for `shared-pool` to reach `RUNNING` |
 | 16 | `verify [env]` | Sanity-checks the environment by running a short sequence of Flink statements — `SHOW TABLES`, then create / describe / show-create / **drop** a throwaway `__verify_probe` table — and **deletes each statement afterward**, so nothing persists. **Repeated once per environment** in `FLINK_ENVIRONMENTS` (default `prod` and `test`). Does **not** create the demo pipeline (that's `demo-pipeline`, below) |
 
@@ -254,6 +358,10 @@ Run these yourself, as needed, after `up`:
 | `generate-data [env] [count] [pool]` | Inserts more random rows into `demo_events` on demand (default `prod`, `20` rows, `shared-pool`) |
 | `application [env] [file]` | Deploys a raw `FlinkApplication` (default `prod`, `app/cpf_basic_app.json`) |
 | `cmf-ui` | Ensures the CMF port-forward (same as step 11) and opens the CMF 2.5 web UI in a browser (root of `localhost:8080`, same port as the REST API) |
+| `security` | Creates the RBAC role bindings for the demo users (needs `CMF_SECURITY_ENABLED=true` on the `cmf` step): `admin` is a super user, every other user is limited to the Flink environment of the same name |
+| `security-test` | Runs the end-to-end security test: authentication plus per-user, per-environment read/write checks; PASS/FAIL per check, non-zero exit on failure |
+| `kafka-acls` | Creates the prefixed Kafka ACLs (needs `KAFKA_SECURITY_ENABLED=true` on the `kafka` step) |
+| `java-app [env]` | Deploys the custom Java job (`app/kafka-demo-job`) in an environment: uploads the JAR as a `cmf://` artifact, creates its sink topic (+ Kafka credentials with Kafka security) and starts it. Needs `CMF_ARTIFACTS_ENABLED=true` |
 | `c3-ui` | Ensures the Control Center port-forward (same as step 12) and opens the C3 web UI in a browser (`http://localhost:9021/home`) |
 | `status` | Shows pod health, Flink environments, and port-forward status |
 | `stop-port-forward` | Stops all background port-forwards started by this script (both the CMF and Control Center forwards) |

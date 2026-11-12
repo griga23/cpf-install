@@ -1,2 +1,5 @@
 *.pid
 .claude/
+app/kafka-demo-job/target/
+.demo-security-users
+.demo-kafka-users

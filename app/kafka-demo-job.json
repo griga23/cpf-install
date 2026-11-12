@@ -1,0 +1,35 @@
+{
+  "apiVersion": "cmf.confluent.io/v1",
+  "kind": "FlinkApplication",
+  "metadata": {
+    "name": "kafka-demo-job"
+  },
+  "spec": {
+    "flinkConfiguration": {
+      "taskmanager.numberOfTaskSlots": "1",
+      "execution.checkpointing.interval": "10s"
+    },
+    "flinkVersion": "v1_19",
+    "image": "confluentinc/cp-flink:1.19.1-cp2",
+    "job": {
+      "jarURI": "cmf://prod/kafka-demo-job.jar?version=1",
+      "entryClass": "io.confluent.demo.CategoryTotalsJob",
+      "parallelism": 1,
+      "state": "running",
+      "upgradeMode": "stateless"
+    },
+    "jobManager": {
+      "resource": {
+        "cpu": 0.5,
+        "memory": "1024m"
+      }
+    },
+    "serviceAccount": "flink",
+    "taskManager": {
+      "resource": {
+        "cpu": 0.5,
+        "memory": "1024m"
+      }
+    }
+  }
+}
