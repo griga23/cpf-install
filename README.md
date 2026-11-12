@@ -9,7 +9,7 @@ of the pipeline (Kafka, CMF, Flink, the SQL demo) is identical on both.
 
 Architecture and security diagrams (CMF components on Kubernetes, users and role
 bindings, how a Flink application gets its Kafka credentials) are in
-[docs/demo-environment.md](docs/demo-environment.md).
+[demo-environment.md](demo-environment.md).
 
 ## Prerequisites
 
