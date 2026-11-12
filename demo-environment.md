@@ -115,7 +115,7 @@ of the CMF picture above.
 | `prod` | `streaming-aggregation` (30 s tumbling windows, `prod_demo_events` to `prod_demo_aggregated`) | `kafka-demo-job`: per-category totals into `prod_java_category_totals`; `basic-example` | `prod_*` | `prod-cat` / `prod-db` |
 | `test` | `streaming-aggregation` on `test_demo_events` to `test_demo_aggregated` | `kafka-demo-job` into `test_java_category_totals` | `test_*` | `test-cat` / `test-db` |
 
-The Java job is in [`app/kafka-demo-job`](../app/kafka-demo-job).
+The Java job is in [`app/kafka-demo-job`](app/kafka-demo-job).
 
 ## Security
 
@@ -357,7 +357,7 @@ role bindings, catalogs and Kafka ACLs as they are.
 
 ## Operating it
 
-Security, artifacts and Kafka security are opt-in flags in [`config.sh`](../config.sh), all
+Security, artifacts and Kafka security are opt-in flags in [`config.sh`](config.sh), all
 off by default. The flags must be exported on every `cmf`, `kafka` or `up` run, otherwise
 those steps roll the features back.
 
