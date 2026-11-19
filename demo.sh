@@ -1418,6 +1418,20 @@ create_or_update_compute_pool() {
   # When artifacts are on, inject the Flink-cluster storage access into clusterSpec so
   # this pool can fetch cmf:// UDF/artifact JARs (no-op passthrough otherwise).
   local rendered; rendered=$(render_spec_to_tmp .spec.clusterSpec "$file")
+  # With artifact storage on, also point checkpoints/savepoints at the bucket so statements
+  # on this pool default to upgradeMode=savepoint (state survives stop/resume). `rendered` is
+  # a temp copy whenever artifacts are on, so editing it in place never touches the repo file.
+  if [[ "$CMF_ARTIFACTS_ENABLED" == "true" && "$FLINK_STATE_STORAGE_ENABLED" == "true" && "$rendered" != "$file" ]]; then
+    local state_base="${FLINK_STATE_BASE_PATH:-${CMF_ARTIFACTS_BASE_PATH%/cmf}/state}"
+    state_base="${state_base%/}"
+    jq --arg b "$state_base" '
+      .spec.clusterSpec.flinkConfiguration += {
+        "state.checkpoints.dir": ($b + "/checkpoints"),
+        "state.savepoints.dir": ($b + "/savepoints"),
+        "execution.checkpointing.externalized-checkpoint-retention": "RETAIN_ON_CANCELLATION"
+      }' "$rendered" > "${rendered}.tmp" && mv "${rendered}.tmp" "$rendered"
+    log "Flink state storage for pool '$name': $state_base/{checkpoints,savepoints}"
+  fi
   # Check existence first so the create-vs-update branch (and its message) is accurate.
   if confluent flink compute-pool describe --environment "$env" "$name" >/dev/null 2>&1; then
     # Exists -> update via REST (the CLI has no `compute-pool update`).

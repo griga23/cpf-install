@@ -76,6 +76,16 @@
 : "${ARTIFACTS_S3_PLUGIN_JAR:=}"
 : "${ARTIFACTS_GCS_PLUGIN_JAR:=}"
 
+# --- Durable Flink state (checkpoints + savepoints) on the artifact bucket ---
+# Only applies when CMF_ARTIFACTS_ENABLED=true (the bucket, filesystem plugin and credentials
+# come from there). Sets state.checkpoints.dir + state.savepoints.dir in every compute pool's
+# flinkConfiguration. With BOTH set, CMF defaults INSERT INTO statements to
+# upgradeMode=savepoint, so a stopped/resumed statement (and a suspended/resumed pool) keeps
+# its state. Without them statements are stateless. SELECT statements never keep state.
+# Setting these in a statement's own flinkConfiguration has no effect - they belong on the pool.
+: "${FLINK_STATE_STORAGE_ENABLED:=true}"
+: "${FLINK_STATE_BASE_PATH:=}"                  # empty = derive as <artifact base path minus /cmf>/state, e.g. gs://cpf-artifacts-<user>/state
+
 # --- Container image versions for cp/cp.yaml ---
 # demo.sh renders these into the manifest before applying it (see cmd_kafka),
 # so bumping a version here is the only change needed - no manual editing of
