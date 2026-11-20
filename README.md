@@ -298,6 +298,24 @@ explicitly only to override, e.g. if a `FlinkApplication` uses a different image
 than the compute pools (verify jar names with `ls /opt/flink/opt` in the image).
 Override `CMF_ARTIFACTS_BASE_PATH` to bring your own path.
 
+#### Durable Flink state (checkpoints + savepoints)
+
+With artifact storage on, `compute-pool` also sets `state.checkpoints.dir` and
+`state.savepoints.dir` on every pool (default `gs://cpf-artifacts-<user>/state/...`, or `s3://`),
+plus `RETAIN_ON_CANCELLATION`. With **both** directories set, CMF defaults `INSERT INTO`
+statements to `upgradeMode: savepoint` (check `status.traits.upgradeMode` in the REST API), so a
+stateful statement keeps its state across `statement stop` / `resume` — including a compute-pool
+`spec.state: SUSPENDED` / `RUNNING` cycle in between. Verified on `prod`'s `shared-pool`: a
+`GROUP BY` count carried from 20 to 40 across stop, pool suspend, pool resume and resume.
+
+- The statement must be stopped before the pool can be suspended or resized (CMF returns
+  HTTP 409 while any statement is `PENDING`/`RECONCILING`/`RESTARTING`/`FAILING`/`RUNNING`).
+- `SELECT` statements never keep state: stop cancels the job and resume starts empty.
+- The directories must be set on the pool; setting them in a statement's `flinkConfiguration` has no effect.
+- Without artifact storage the pools get no directories and statements are stateless.
+- Opt out with `FLINK_STATE_STORAGE_ENABLED=false`; override the location with `FLINK_STATE_BASE_PATH`.
+- Re-running `compute-pool` only updates a pool with no active statements; stop them first.
+
 ## Command reference
 
 Every subcommand is also runnable standalone — e.g. after editing

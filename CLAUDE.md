@@ -128,6 +128,11 @@ any other config change.
   their own copy. `cmd_down` tears the bucket/creds back down; on GCP, set
   `ARTIFACTS_GCS_SA=<existing-sa-email>` to reuse an SA on projects at their
   service-account quota (then `down` only deletes the minted key, not the SA).
+  With artifacts on, `create_or_update_compute_pool` also injects `state.checkpoints.dir` +
+  `state.savepoints.dir` (`<bucket>/state/...`, `FLINK_STATE_STORAGE_ENABLED`) into every pool: both
+  set => CMF defaults `INSERT INTO` statements to `upgradeMode: savepoint`, so state survives
+  statement stop/resume and a pool suspend/resume. `SELECT` never keeps state, and the dirs only work
+  on the pool, not in a statement's own config.
 - **CMF 2.5 feature flags** (`CMF_ENVIRONMENT_CATALOG_ENABLED`,
   `CMF_MCP_ENABLED`, `CMF_MCP_WRITE_TOOLS_ENABLED`, `CMF_STACKTRACE_LOGGING`,
   `CMF_ARTIFACTS_ENABLED`) are passed by `cmd_cmf` as helm `--set` flags,
@@ -166,6 +171,19 @@ any other config change.
   `render_flink_storage` MERGES into an existing `podTemplate` (the Java app's Kafka-credential
   env vars). Test traps: console producer/consumer exit 0 on authorization errors - judge by
   output text and real topic contents; bash 3.2 has no `declare -A`.
+- **Security has two planes; keep them straight when explaining or extending the demo.**
+  *Control plane* = CMF (embedded MDS authn + RBAC): the **human** (`admin`/`prod`/`test`) — who may
+  submit/stop/edit statements, and who may see/edit catalogs and secrets (`FlinkCatalog`/secret role
+  bindings only govern view/edit of the resource; the docs define no SQL "use" permission). *Data
+  plane* = Kafka (SASL/PLAIN + ACLs): the **service identity** (`flink_<env>`) — what a running job
+  can actually read/write. The bridge is the environment-scoped `EnvironmentSecretMapping`: a
+  statement runs with the credentials mapped in its environment regardless of who submitted it, so
+  Kafka (and its audit log) only ever sees `flink_<env>`, never the human. Consequences: (1)
+  data-plane least privilege is per credential, i.e. per environment, not per person; (2) a
+  catalog/database has ONE connection secret; (3) cross-catalog isolation in `security-test` comes
+  from the per-environment mapping + environment-scoped `ddlEnvironments`, not from catalog RBAC.
+  Kafka gotcha: a refused statement is accepted then fails at runtime (CMF's exceptions endpoint
+  stays empty, evidence is in the Flink pod logs). Schema Registry is open in this demo.
 - **Port-forwards verify actual reachability, not just PID liveness.**
   `ensure_port_forward` (used by `cmd_cmf_forward`/`cmd_c3_forward`/every step
   that talks to CMF) checks `is_port_serving` — a real HTTP round trip, not
