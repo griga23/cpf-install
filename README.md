@@ -131,6 +131,7 @@ values schema, so a wrong key fails the upgrade):
 | `CMF_MCP_ENABLED` | `true` | `cmf.mcp.enabled` — MCP server at `/cmf/mcp/v1alpha1` for AI agents |
 | `CMF_MCP_WRITE_TOOLS_ENABLED` | `false` | `cmf.mcp.writeTools.enabled` — MCP create/update/delete (`false` = read-only) |
 | `CMF_STACKTRACE_LOGGING` | `true` | `cmf.stackTraceLogging` |
+| `CMF_UI_ROLE_BINDING_ENABLED` | `true` | `cmf.ui.roleBinding.enabled` — manage role bindings in the CMF web UI (needs `CMF_SECURITY_ENABLED=true`) |
 | `CMF_ARTIFACTS_ENABLED` | `false` | `cmf.artifacts.enabled` — provision blob storage + wire it in (see [Artifact storage](#artifact-storage-cmf-24)) |
 | `CMF_ARTIFACTS_BASE_PATH` | _(auto)_ | `cmf.artifacts.basePath` — auto-derived as `<scheme>://cpf-artifacts-<user>/cmf`; set it only to bring your own path |
 

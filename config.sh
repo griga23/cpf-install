@@ -48,6 +48,7 @@
 : "${CMF_ENVIRONMENT_CATALOG_ENABLED:=true}"   # cmf.sql.environmentCatalog.enabled - CREATE FUNCTION ... USING JAR + custom connectors/formats (CREATE TABLE ... WITH ('connector'=...))
 : "${CMF_MCP_ENABLED:=true}"                    # cmf.mcp.enabled - MCP server at /cmf/mcp/v1alpha1 for AI agents (Claude Code, Cursor)
 : "${CMF_MCP_WRITE_TOOLS_ENABLED:=false}"       # cmf.mcp.writeTools.enabled - allow MCP create/update/delete (false = read-only)
+: "${CMF_UI_ROLE_BINDING_ENABLED:=true}"         # cmf.ui.roleBinding.enabled - role-binding management in the CMF web UI (only meaningful with CMF_SECURITY_ENABLED=true)
 : "${CMF_STACKTRACE_LOGGING:=true}"             # cmf.stackTraceLogging - log stack traces on error (2.4 default true)
 # Artifact management (upload Flink JARs to blob storage, reference via cmf://).
 # OFF by default: enabling it REQUIRES a basePath or CMF refuses to start, so set

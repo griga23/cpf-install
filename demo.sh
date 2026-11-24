@@ -128,9 +128,9 @@ kafka_security_block() {
       - listener.security.protocol.map=CONTROLLER:SASL_PLAINTEXT,REPLICATION:PLAINTEXT
       - sasl.enabled.mechanisms=PLAIN
       - sasl.mechanism.controller.protocol=PLAIN
-      - listener.name.controller.plain.sasl.jaas.config=${plain} required user_kafka="${kpw}";
+      - listener.name.controller.plain.sasl.jaas.config=${plain} required username="kafka" password="${kpw}" user_kafka="${kpw}";
       - authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
-      - super.users=User:kafka
+      - super.users=User:kafka;User:sr;User:c3
 EOF
       ;;
     BROKER)
@@ -914,6 +914,7 @@ cmd_cmf() {
     --set cmf.mcp.enabled="$CMF_MCP_ENABLED"
     --set cmf.mcp.writeTools.enabled="$CMF_MCP_WRITE_TOOLS_ENABLED"
     --set cmf.stackTraceLogging="$CMF_STACKTRACE_LOGGING"
+    --set cmf.ui.roleBinding.enabled="$CMF_UI_ROLE_BINDING_ENABLED"
   )
   # Artifact management refuses to start without a basePath, so only enable it when
   # one is configured. Credentials are read from $ARTIFACTS_CREDS_SECRET (created by
@@ -1013,7 +1014,7 @@ cmd_cmf() {
     )
     log "CMF security: embedded MDS + RBAC enabled (super user: $super; users: $CMF_SECURITY_USERS)"
   fi
-  log "CMF feature flags: environmentCatalog=$CMF_ENVIRONMENT_CATALOG_ENABLED mcp=$CMF_MCP_ENABLED (writeTools=$CMF_MCP_WRITE_TOOLS_ENABLED) artifacts=$CMF_ARTIFACTS_ENABLED"
+  log "CMF feature flags: environmentCatalog=$CMF_ENVIRONMENT_CATALOG_ENABLED mcp=$CMF_MCP_ENABLED (writeTools=$CMF_MCP_WRITE_TOOLS_ENABLED) uiRoleBinding=$CMF_UI_ROLE_BINDING_ENABLED artifacts=$CMF_ARTIFACTS_ENABLED"
   helm upgrade --install cmf confluentinc/confluent-manager-for-apache-flink \
     --version "$CMF_VERSION" \
     "${set_args[@]}" \
